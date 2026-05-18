@@ -314,6 +314,7 @@ ${tail}`
 
 	return { messages: out, info: { trimmedCount, savedChars, savedTokens } }
 }
+void _compactToolResultsForRequest
 
 
 
