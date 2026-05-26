@@ -344,13 +344,6 @@ openai on developer system message - https://cdn.openai.com/spec/model-spec-2024
 
 const prepareMessages_openai_tools = (
 	messages: SimpleLLMMessage[],
-	// Emit `reasoning_content` on assistant messages that captured it. DeepSeek V4
-	// thinking mode REQUIRES this on every prior assistant turn that produced
-	// reasoning, regardless of whether the turn had tool calls (otherwise: 400).
-	// Other OpenAI-compat providers don't consume the field and might surface it
-	// as "unknown property" warnings, so we only opt in by provider.
-	// See note-deepseek.md §5 for the exact constraint and why we don't optimise
-	// non-tool turns away.
 	supportsOAICompatReasoningContent: boolean,
 ): AnthropicOrOpenAILLMMessage[] => {
 
@@ -369,25 +362,10 @@ const prepareMessages_openai_tools = (
 			}
 			if (supportsOAICompatReasoningContent && currMsg.reasoningContent !== undefined) {
 				// DeepSeek V4 thinking mode: replay reasoning_content on EVERY
-				// prior assistant turn captured under thinking mode, regardless
-				// of whether it had tool_calls AND regardless of whether the
-				// model actually produced any reasoning text. The published docs
-				// claim a "Case A vs Case B" split (only tool-call turns require
-				// it), but the live API returns 400 "The reasoning_content in
-				// the thinking mode must be passed back to the API" if the field
-				// is missing on ANY prior thinking-mode turn — including the
-				// short "Done."-style follow-ups that come back from the model
-				// with an empty reasoning blob after a tool round-trip.
-				// Hence the `!== undefined` gate (vs truthy): an explicit empty
-				// string means "captured, model said nothing" and must round-trip
-				// as `reasoning_content: ""`. Only `undefined` (= field never
-				// captured, e.g. legacy history or non-thinking turn) skips emit.
-				// The recommended pattern from the docs is to append
-				// `response.choices[0].message` verbatim, which carries content +
-				// reasoning_content + tool_calls together. We do exactly that.
-				// Cost trade-off: input tokens grow by the size of all stored
-				// reasoning blobs in the thread. The prefix cache mitigates this
-				// because the field bytes stay identical turn-to-turn.
+				// prior assistant turn. Required by their API — omitting it causes 400.
+				// For other providers using separate_reasoning=false, reasoning
+				// is already embedded in content as <think> tags by the server,
+				// so it naturally round-trips without this field.
 				out.reasoning_content = currMsg.reasoningContent
 			}
 			newMessages.push(out)
@@ -630,6 +608,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 	reservedOutputTokenSpace,
 	charsPerToken,
 	priorContentTokens,
+	replayReasoningInHistory,
 	providerName,
 }: {
 	messages: SimpleLLMMessage[],
@@ -642,9 +621,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 	reservedOutputTokenSpace: number | null | undefined,
 	charsPerToken: number,
 	priorContentTokens?: number,
-	// Threaded through so `prepareMessages_openai_tools` can opt-in to
-	// `reasoning_content` round-trip on assistant messages (DeepSeek V4 only,
-	// today). See `prepareMessages_openai_tools` for the gate.
+	replayReasoningInHistory?: boolean,
 	providerName?: ProviderName,
 }): {
 	messages: AnthropicOrOpenAILLMMessage[],
@@ -837,13 +814,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 		llmChatMessages = prepareMessages_anthropic_tools(messages as SimpleLLMMessage[], supportsAnthropicReasoning)
 	}
 	else if (specialToolFormat === 'openai-style') {
-		// Per-provider opt-in for `reasoning_content` round-trip on assistant messages.
-		// Today: DeepSeek V4 (required for thinking + tools — see note-deepseek.md §5).
-		// Other providers may need it later (e.g. OpenRouter routes that proxy to
-		// DeepSeek); extend this set rather than making it a model-level capability
-		// so we can flip whole providers at once.
-		const supportsOAICompatReasoningContent = providerName === 'deepseek'
-		llmChatMessages = prepareMessages_openai_tools(messages as SimpleLLMMessage[], supportsOAICompatReasoningContent)
+		llmChatMessages = prepareMessages_openai_tools(messages as SimpleLLMMessage[], !!replayReasoningInHistory)
 	}
 	const llmMessages = llmChatMessages
 
@@ -980,6 +951,7 @@ const prepareMessages = (params: {
 	supportsAnthropicReasoning: boolean,
 	contextWindow: number,
 	reservedOutputTokenSpace: number | null | undefined,
+	replayReasoningInHistory?: boolean,
 	providerName: ProviderName,
 	charsPerToken: number,
 	priorContentTokens?: number,
@@ -1061,14 +1033,14 @@ export interface IConvertToLLMMessageService {
 	// can route the entry to the right thread file. `telemetryRequestId` in the
 	// result is the rid the caller must echo back to `IRequestTelemetryService.logResponse`
 	// so request and response lines can be paired during analysis.
-	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number, threadId?: string, pendingImageBytes?: Map<string, Uint8Array>, frozenAiInstructions?: string }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number, telemetryRequestId?: string }>
+	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, priorContentTokens?: number, threadId?: string, pendingImageBytes?: Map<string, Uint8Array>, frozenAiInstructions?: string, manualCompaction?: { summary: string, boundaryIdx: number } }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined, compactionInfo: CompactionInfo | null, sentChars: number, telemetryRequestId?: string }>
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
 	// Called by chat creation paths to snapshot runtime grounding (date, open files,
 	// active URI, directory listing, terminal IDs) into a user message at storage time.
-	// Baking volatile into the stored content (rather than prepending at send time)
-	// keeps prior turns byte-identical across requests so the provider's prefix cache
-	// stays warm turn-over-turn.
-	generateChatVolatileContext: (opts: { chatMode: ChatMode }) => Promise<string>
+	// Turn 1 includes the full directory listing; subsequent turns include only a
+	// compact diff of added/removed files (compared against prevDirectorySnapshot).
+	// Returns the volatile string and the updated snapshot for the caller to persist.
+	generateChatVolatileContext: (opts: { chatMode: ChatMode, includeDirectoryListing?: boolean, prevDirectorySnapshot?: string[] }) => Promise<{ volatile: string, directorySnapshot: string[] | undefined }>
 
 	// Called by `chatThreadService` after each LLM response resolves with a
 	// reported `inputTokens`. Updates the per-model chars/token ratio via EMA
@@ -1077,6 +1049,7 @@ export interface IConvertToLLMMessageService {
 	// missing/invalid inputs so callers can pass what they have without
 	// guarding every field.
 	recordTokenUsageCalibration(opts: { providerName: string, modelName: string, sentChars: number, reportedInputTokens: number | undefined }): void
+	getCharsPerToken(providerName: string, modelName: string): number
 
 	// Returns the current combined `.voidrules` file content (all workspace
 	// folders concatenated, `\n\n` separated). Reads fresh from disk on every
@@ -1129,6 +1102,10 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 	// request against this model yet in the current session.
 	private _getCharsPerToken(providerName: string, modelName: string): number {
 		return this._charsPerTokenByModel.get(this._calibrationKey(providerName, modelName)) ?? CHARS_PER_TOKEN
+	}
+
+	getCharsPerToken: IConvertToLLMMessageService['getCharsPerToken'] = (providerName, modelName) => {
+		return this._getCharsPerToken(providerName, modelName)
 	}
 
 	recordTokenUsageCalibration: IConvertToLLMMessageService['recordTokenUsageCalibration'] = ({ providerName, modelName, sentChars, reportedInputTokens }) => {
@@ -1353,17 +1330,63 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		return chat_systemMessage({ chatMode, mcpTools, includeXMLToolDefinitions })
 	}
 
-	generateChatVolatileContext: IConvertToLLMMessageService['generateChatVolatileContext'] = async ({ chatMode }) => {
+	private async _getDirectoryPaths(): Promise<string[]> {
+		const paths: string[] = []
+		const folders = this.workspaceContextService.getWorkspace().folders
+		for (const f of folders) {
+			try {
+				const uris = await this.directoryStrService.getAllURIsInDirectory(f.uri, { maxResults: 2000 })
+				for (const u of uris) paths.push(u.fsPath)
+			} catch { /* folder may not exist */ }
+		}
+		return paths
+	}
+
+	private _computeDirectoryDiff(prev: Set<string>, curr: Set<string>): string | null {
+		const added: string[] = []
+		const removed: string[] = []
+		for (const p of curr) { if (!prev.has(p)) added.push(p) }
+		for (const p of prev) { if (!curr.has(p)) removed.push(p) }
+		if (added.length === 0 && removed.length === 0) return null
+		const lines: string[] = []
+		if (added.length > 0) {
+			lines.push(`New files/directories since last turn:`)
+			for (const p of added.slice(0, 50)) lines.push(`  + ${p}`)
+			if (added.length > 50) lines.push(`  ... and ${added.length - 50} more`)
+		}
+		if (removed.length > 0) {
+			lines.push(`Removed files/directories since last turn:`)
+			for (const p of removed.slice(0, 50)) lines.push(`  - ${p}`)
+			if (removed.length > 50) lines.push(`  ... and ${removed.length - 50} more`)
+		}
+		return lines.join('\n')
+	}
+
+	generateChatVolatileContext: IConvertToLLMMessageService['generateChatVolatileContext'] = async ({ chatMode, includeDirectoryListing = true, prevDirectorySnapshot }) => {
 		const workspaceFolders = this.workspaceContextService.getWorkspace().folders.map(f => f.uri.fsPath)
 		const openedURIs = this.modelService.getModels().filter(m => m.isAttachedToEditor()).map(m => m.uri.fsPath) || [];
 		const activeURI = this.editorService.activeEditor?.resource?.fsPath;
-		const directoryStr = await this.directoryStrService.getAllDirectoriesStr({
-			cutOffMessage: chatMode === 'agent' || chatMode === 'gather' ?
-				`...Directories string cut off, use tools to read more...`
-				: `...Directories string cut off, ask user for more if necessary...`
-		})
 		const persistentTerminalIDs = this.terminalToolService.listPersistentTerminalIds()
-		return chat_volatileContext({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode })
+
+		let directoryStr = ''
+		let directoryDiff: string | null = null
+		let directorySnapshot: string[] | undefined
+
+		if (includeDirectoryListing) {
+			directoryStr = await this.directoryStrService.getAllDirectoriesStr({
+				cutOffMessage: chatMode === 'agent' || chatMode === 'gather' ?
+					`...Directories string cut off, use tools to read more...`
+					: `...Directories string cut off, ask user for more if necessary...`
+			})
+			directorySnapshot = await this._getDirectoryPaths()
+		} else if (prevDirectorySnapshot) {
+			const currPaths = await this._getDirectoryPaths()
+			directoryDiff = this._computeDirectoryDiff(new Set(prevDirectorySnapshot), new Set(currPaths))
+			directorySnapshot = currPaths
+		}
+
+		const volatile = chat_volatileContext({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode, includeDirectoryListing, directoryDiff })
+		return { volatile, directorySnapshot }
 	}
 
 
@@ -1450,6 +1473,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			specialToolFormat,
 			contextWindow,
 			supportsSystemMessage,
+			reasoningCapabilities,
 		} = getModelCapabilities(providerName, modelName, overridesOfModel)
 
 		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection[featureName]?.[modelSelection.providerName]?.[modelSelection.modelName]
@@ -1469,12 +1493,13 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			supportsAnthropicReasoning: providerName === 'anthropic',
 			contextWindow,
 			reservedOutputTokenSpace,
+			replayReasoningInHistory: reasoningCapabilities ? reasoningCapabilities.replayReasoningInHistory : false,
 			providerName,
 			charsPerToken: this._getCharsPerToken(providerName, modelName),
 		})
 		return { messages, separateSystemMessage };
 	}
-	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens, threadId, pendingImageBytes, frozenAiInstructions }) => {
+	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, priorContentTokens, threadId, pendingImageBytes, frozenAiInstructions, manualCompaction }) => {
 		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined, compactionInfo: null, sentChars: 0 }
 
 		const { overridesOfModel } = this.voidSettingsService.state
@@ -1485,6 +1510,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			contextWindow,
 			supportsSystemMessage,
 			supportsVision,
+			reasoningCapabilities,
 		} = getModelCapabilities(providerName, modelName, overridesOfModel)
 
 		const { disableSystemMessage } = this.voidSettingsService.state.globalSettings;
@@ -1512,12 +1538,60 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// byte-identical to what was sent before, keeping the provider's prefix
 		// cache warm across turns.
 		const llmMessagesRaw = await this._chatMessagesToSimpleMessages(chatMessages, { supportsVision, pendingImageBytes })
+
+		// Manual compaction — if the thread has an LLM-generated summary,
+		// replace all messages before the boundary with a single user message
+		// containing the summary + an assistant acknowledgement. Messages at/
+		// after the boundary pass through unchanged.
+		//
+		// `boundaryIdx` is an index into the ChatMessage[] array, but
+		// `llmMessagesRaw` is a SimpleLLMMessage[] where checkpoint and
+		// interrupted_streaming_tool entries are skipped. We must map the
+		// ChatMessage boundary to the corresponding SimpleLLMMessage index.
+		let llmMessages: SimpleLLMMessage[]
+		if (manualCompaction && manualCompaction.boundaryIdx > 0) {
+			let llmBoundary = 0
+			for (let ci = 0; ci < Math.min(manualCompaction.boundaryIdx, chatMessages.length); ci++) {
+				const role = chatMessages[ci].role
+				if (role !== 'checkpoint' && role !== 'interrupted_streaming_tool') {
+					llmBoundary++
+				}
+			}
+			if (llmBoundary > 0 && llmBoundary <= llmMessagesRaw.length) {
+				// The first user message (which carried the directory listing) is
+				// now inside the compacted region. Re-inject a fresh volatile
+				// context (with directory listing) so the LLM retains awareness
+				// of the workspace structure after compaction.
+				const { volatile: freshVolatile } = await this.generateChatVolatileContext({ chatMode, includeDirectoryListing: true })
+				const summaryContent = [
+					freshVolatile,
+					'',
+					'[Conversation compacted — summary of prior context]',
+					'',
+					manualCompaction.summary,
+				].join('\n')
+				const summaryUser: SimpleLLMMessage = {
+					role: 'user',
+					content: summaryContent,
+				}
+				const summaryAssistant: SimpleLLMMessage = {
+					role: 'assistant',
+					content: 'Understood. Continuing with the context above.',
+					anthropicReasoning: null,
+				}
+				llmMessages = [summaryUser, summaryAssistant, ...llmMessagesRaw.slice(llmBoundary)]
+			} else {
+				llmMessages = llmMessagesRaw
+			}
+		} else {
+			llmMessages = llmMessagesRaw
+		}
+
 		// Perf 2 — Light-tier history compaction DISABLED.
 		// Trimming tool result bodies breaks the provider's prefix cache at the
 		// trim point. At large context sizes (500k+) the cache miss cost far
 		// outweighs the token savings from trimming, since the entire prefix
 		// must be re-ingested.
-		const llmMessages = llmMessagesRaw
 		const compactionInfo: CompactionInfo | null = null
 
 		const { messages, separateSystemMessage, emergencyInfo } = prepareMessages({
@@ -1529,6 +1603,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			supportsAnthropicReasoning: providerName === 'anthropic',
 			contextWindow,
 			reservedOutputTokenSpace,
+			replayReasoningInHistory: reasoningCapabilities ? reasoningCapabilities.replayReasoningInHistory : false,
 			providerName,
 			charsPerToken,
 			priorContentTokens,

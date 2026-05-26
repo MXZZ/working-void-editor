@@ -38,7 +38,8 @@ import { IRequestTelemetryService } from './requestTelemetryService.js';
 import { RunOnceScheduler, timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
 import { IWorkspaceContextService, toWorkspaceIdentifier } from '../../../../platform/workspace/common/workspace.js';
-import { basename as resourceBasename } from '../../../../base/common/resources.js';
+import { basename as resourceBasename, joinPath } from '../../../../base/common/resources.js';
+import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { IDirectoryStrService } from '../common/directoryStrService.js';
 import { buildTestMessages, runSimulatedStream } from './chatThreadDevTools.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
@@ -217,6 +218,25 @@ export type ThreadType = {
 	importedFromWorkspaceUri?: string;
 	importedFromThreadId?: string;
 	importedAt?: number; // unix ms
+
+	// ===== Manual compaction (LLM-powered summarization) =====
+	// Set when the user triggers manual compaction. `compactionSummary` holds
+	// the LLM-generated summary text; `compactionBoundaryIdx` is the message
+	// index where the compacted region ends — messages before this index are
+	// replaced by the summary in the LLM view (but still visible as bubbles
+	// in the UI). Messages at/after this index are sent to the LLM as-is.
+	// `compactionPercent` records the compression ratio used (e.g. 90 means
+	// the summary targets ~10% of the original token count).
+	// Both undefined when no compaction has been performed.
+	compactionSummary?: string;
+	compactionBoundaryIdx?: number;
+	compactionPercent?: number;
+	compactionSavedTokens?: number;
+
+	// Snapshot of workspace file paths from the last directory listing sent to
+	// the LLM. Used to compute a compact diff on subsequent turns instead of
+	// repeating the full directory tree. Persisted so it survives reload.
+	directorySnapshot?: string[];
 
 	// User-provided override of the auto-derived tab / history label. When
 	// non-empty, used as the display label everywhere; when undefined or
@@ -532,6 +552,16 @@ export interface IChatThreadService {
 	focusCurrentChat: () => Promise<void>
 	blurCurrentChat: () => Promise<void>
 
+	// Manual compaction — user-triggered LLM-powered summarization. Sends the
+	// oldest messages (before the protection boundary) to the current model for
+	// summarization at the given compression ratio. The summary replaces those
+	// messages in the LLM view; the UI keeps showing the original bubbles.
+	// `compactPercent` is how much to compress (e.g. 90 → summary ≈ 10% of
+	// original tokens). `protectTurns` / `protectMessages` control how many
+	// recent user turns / messages are kept uncompacted (defaults: 3 / 10).
+	// Returns null on success, or an error message string.
+	compactCurrentThread(opts: { compactPercent: number, protectTurns?: number, protectMessages?: number }): Promise<string | null>;
+
 	// Dev-only: populate the current thread with a large fake conversation
 	// for performance testing.
 	_populateTestThread(turns?: number): void;
@@ -594,6 +624,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@IFileService private readonly _fileService: IFileService,
 		@IMCPService private readonly _mcpService: IMCPService,
 		@IRequestTelemetryService private readonly _requestTelemetryService: IRequestTelemetryService,
+		@IEnvironmentService private readonly _environmentService: IEnvironmentService,
 	) {
 		super()
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string, pinnedThreadIds: [] } // default state
@@ -626,7 +657,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		for (const id in allThreads) {
 			const t = allThreads[id]
 			if (t?.latestUsage) this.latestUsageOfThreadId[id] = t.latestUsage
-			if (t?.cumulativeUsageThisThread) this.cumulativeUsageThisThreadOfThreadId[id] = t.cumulativeUsageThisThread
+			if (t?.cumulativeUsageThisThread) {
+				this.cumulativeUsageThisThreadOfThreadId[id] = t.cumulativeUsageThisThread
+				// Restore the baseline so the first _setLatestUsage after reload
+				// adds on top of the persisted total instead of overwriting it.
+				this._cumulativeThisThreadBaselineOfThreadId[id] = t.cumulativeUsageThisThread
+			}
 			if (t?.latestCompaction) this.latestCompactionOfThreadId[id] = t.latestCompaction
 			if (t?.cumulativeCompactionThisThread) this.cumulativeCompactionThisThreadOfThreadId[id] = t.cumulativeCompactionThisThread
 		}
@@ -2015,7 +2051,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const lastUsage = this.latestUsageOfThreadId[threadId]
 			const priorContentTokens = lastUsage ? (lastUsage.inputTokens ?? 0) + (lastUsage.outputTokens ?? 0) : undefined
 			const pendingImageBytes = this._pendingImageBytesByThread.get(threadId)
-			const frozenAiInstructions = this.state.allThreads[threadId]?.frozenAiInstructions
+			const currentThread = this.state.allThreads[threadId]
+			const frozenAiInstructions = currentThread?.frozenAiInstructions
+			const manualCompaction = currentThread?.compactionSummary && currentThread?.compactionBoundaryIdx
+				? { summary: currentThread.compactionSummary, boundaryIdx: currentThread.compactionBoundaryIdx }
+				: undefined
 			const { messages, separateSystemMessage, compactionInfo, sentChars, telemetryRequestId } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
 				chatMessages,
 				modelSelection,
@@ -2024,6 +2064,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				threadId,
 				pendingImageBytes,
 				frozenAiInstructions,
+				manualCompaction,
 			})
 			// Images are only attached on the first user message of a turn;
 			// clear after the first prepare so subsequent tool-loop iterations
@@ -2051,6 +2092,47 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			if (interruptedWhenIdle) {
 				this._setStreamState(threadId, undefined)
 				return
+			}
+
+			// Prefix-cache investigation log: dump each message's role, char length,
+			// content hash, and cumulative hash so we can spot where the prefix diverges
+			// between turns. The cumulative hash represents the byte-identical prefix
+			// up to (and including) that message — if it matches the previous turn's
+			// cumulative hash at the same index, the provider can reuse its KV cache.
+			{
+				const djb2 = (s: string): string => {
+					let h = 5381
+					for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0
+					return (h >>> 0).toString(16).padStart(8, '0')
+				}
+				const msgContent = (m: typeof messages[number]): string => {
+					if ('content' in m) {
+						const c = m.content
+						if (typeof c === 'string') return c
+						if (Array.isArray(c)) return c.map(p => {
+							if ('text' in p && typeof p.text === 'string') return p.text
+							if ('content' in p && typeof p.content === 'string') return p.content
+							if ('type' in p) return `[${p.type}]`
+							return ''
+						}).join('|')
+					}
+					if ('parts' in m) return m.parts.map(p => 'text' in p && typeof p.text === 'string' ? p.text : '[part]').join('|')
+					return ''
+				}
+				let cumStr = ''
+				const sysMsg = separateSystemMessage || ''
+				if (sysMsg) cumStr += sysMsg
+				const lines: string[] = []
+				if (sysMsg) lines.push(`  [sys] len=${sysMsg.length} hash=${djb2(sysMsg)} cumHash=${djb2(cumStr)}`)
+				for (let i = 0; i < messages.length; i++) {
+					const m = messages[i]
+					const role = ('role' in m) ? (m as { role: string }).role : '?'
+					const content = msgContent(m)
+					cumStr += content
+					const preview = content.slice(0, 60).replace(/\n/g, '\\n')
+					lines.push(`  [${i}] ${role} len=${content.length} hash=${djb2(content)} cumHash=${djb2(cumStr)} "${preview}..."`)
+				}
+				console.log(`[PrefixCache] thread=${threadId.slice(0, 8)} turn=${nMessagesSent} msgs=${messages.length} totalChars=${sentChars}\n${lines.join('\n')}`)
 			}
 
 			let shouldRetryLLM = true
@@ -2084,7 +2166,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						this._scheduleStreamTextUpdate(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: fullText, reasoningSoFar: fullReasoning, toolCallsSoFar: toolCalls ?? [] }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
 					},
 					onFinalMessage: async ({ fullText, fullReasoning, toolCalls, anthropicReasoning, usage, finishReason }) => {
-						if (usage) this._setLatestUsage(threadId, usage)
+						console.log(`[PrefixCache:final] thread=${threadId.slice(0, 8)} finishReason=${finishReason} fullReasoning.len=${fullReasoning?.length ?? 0} fullText.len=${fullText?.length ?? 0} toolCalls=${toolCalls?.length ?? 0} anthropicReasoning=${anthropicReasoning?.length ?? 0}`)
+						if (fullReasoning) console.log(`[PrefixCache:reasoning] "${fullReasoning}"`)
+						if (usage) {
+							console.log(`[PrefixCache:usage] thread=${threadId.slice(0, 8)} input=${usage.inputTokens} cached=${usage.cachedInputTokens} output=${usage.outputTokens} reasoning=${usage.reasoningTokens} total=${usage.totalTokens}`)
+							this._setLatestUsage(threadId, usage)
+						}
 						// Lock in this request's usage so the next loop iteration's
 						// running total is added to (not replacing) what we already counted.
 						this._lockInCurrentRequestUsage(threadId)
@@ -2650,13 +2737,25 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 		const userMessageContent = await chat_userMessageContent(instructions, currSelns, { directoryStrService: this._directoryStringService, fileService: this._fileService }) // user message + names of files (NOT content)
 
-		// Snapshot the volatile runtime context (date, open files, active URI,
-		// directory listing, terminal IDs) into this user message's stored content
-		// so past turns stay byte-identical across subsequent requests. The volatile
-		// block goes into `content` (what the LLM sees) but NOT into `displayContent`
-		// (what the UI renders), so the chat bubble shows only the user's words.
+		// Turn 1 gets the full directory listing (~20k chars / ~5k tokens).
+		// Subsequent turns get lightweight volatile (active file, open files,
+		// date, terminals — ~200-300 chars) plus a compact diff of any
+		// files/directories that changed since the last snapshot (persisted on
+		// the thread so it survives window reload).
 		const { chatMode } = this._settingsService.state.globalSettings
-		const volatileBlock = await this._convertToLLMMessagesService.generateChatVolatileContext({ chatMode })
+		const isFirstUserMessage = !thread.messages.some(m => m.role === 'user')
+		const needsFullListing = isFirstUserMessage || !thread.directorySnapshot
+		const { volatile: volatileBlock, directorySnapshot } = await this._convertToLLMMessagesService.generateChatVolatileContext({
+			chatMode,
+			includeDirectoryListing: needsFullListing,
+			prevDirectorySnapshot: thread.directorySnapshot,
+		})
+		if (directorySnapshot) {
+			const updatedThread: ThreadType = { ...thread, directorySnapshot }
+			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
+			this._storeThread(threadId, updatedThread)
+			this._setState({ allThreads: newThreads })
+		}
 		const contentWithVolatile = volatileBlock
 			? `${volatileBlock}\n\n${userMessageContent}`
 			: userMessageContent
@@ -2864,6 +2963,11 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
+
+		// Block editing messages in the compacted region — the LLM no longer
+		// sees their original content (only the summary), so re-sending from
+		// this point would produce degraded results.
+		if (thread.compactionBoundaryIdx !== undefined && messageIdx < thread.compactionBoundaryIdx) return
 
 		const editedMessage = thread.messages[messageIdx]
 		if (editedMessage?.role !== 'user') {
@@ -3954,6 +4058,280 @@ We only need to do it for files that were edited since `from`, ie files between 
 		this._setCurrentMessageState(newState, messageIdx)
 	}
 
+
+	// ── Manual compaction ────────────────────────────────────────────────
+
+	async compactCurrentThread({ compactPercent, protectTurns = 3, protectMessages = 10 }: { compactPercent: number, protectTurns?: number, protectMessages?: number }): Promise<string | null> {
+		const threadId = this.state.currentThreadId
+		const thread = this.state.allThreads[threadId]
+		if (!thread || thread.messages.length < 10) return 'Not enough messages to compact.'
+
+		const modelSelection = this._settingsService.state.modelSelectionOfFeature['Chat']
+		if (!modelSelection) return 'No model selected for Chat.'
+
+		const chatMessages = thread.messages
+		const boundaryIdx = this._computeManualCompactionBoundary(chatMessages, protectTurns, protectMessages)
+		if (boundaryIdx <= 0) {
+			return `Not enough messages outside the protection zone (last ${protectTurns} user turns / ${protectMessages} messages).`
+		}
+
+		const targetPercent = Math.max(1, Math.round(100 - compactPercent))
+
+		// Estimate the character count of the compactable region so we can
+		// give the LLM a concrete target length instead of a vague percentage.
+		let compactableChars = 0
+		for (let i = 0; i < boundaryIdx && i < chatMessages.length; i++) {
+			const msg = chatMessages[i]
+			if (msg.role !== 'checkpoint' && msg.role !== 'interrupted_streaming_tool') {
+				if (msg.role === 'user') compactableChars += (msg.content?.length ?? 0)
+				else if (msg.role === 'assistant') compactableChars += (msg.displayContent?.length ?? 0) + (msg.reasoning?.length ?? 0)
+				else if (msg.role === 'tool') {
+					compactableChars += (msg.rawParamsStr?.length ?? 0)
+					const r = msg.result
+					if (typeof r === 'string') compactableChars += r.length
+					else if (r && typeof r === 'object' && 'content' in r && typeof (r as { content?: string }).content === 'string') compactableChars += ((r as { content: string }).content.length)
+				}
+			}
+		}
+		const targetChars = Math.max(500, Math.round(compactableChars * targetPercent / 100))
+		const charsPerToken = this._convertToLLMMessagesService.getCharsPerToken(modelSelection.providerName, modelSelection.modelName)
+		const targetTokens = Math.round(targetChars / charsPerToken)
+
+		// The conversation is already in the LLM messages (prefix-cached).
+		// The extraction instruction tells the LLM what to do with it.
+		// Framed as "extract and organize" rather than "summarize" — LLMs
+		// compress much less aggressively when asked to extract vs summarize.
+		// Per-section minimum word counts give granular targets that are easier
+		// for the model to hit than a single overall length.
+		const wordsPerSection = Math.max(50, Math.round(targetTokens / 10))
+		const summarizationPrompt = [
+			'Extract and organize the key information from our conversation into a structured reference document.',
+			'The system prompt and rules are preserved separately — do NOT include them.',
+			'This document REPLACES the full conversation history, so it must contain everything needed to continue the work.',
+			'',
+			`TARGET LENGTH: ~${targetTokens.toLocaleString()} tokens (~${targetChars.toLocaleString()} characters). The conversation being compressed is ~${Math.round(compactableChars / charsPerToken).toLocaleString()} tokens.`,
+			'',
+			`Write each section below. Each section must be AT LEAST ${wordsPerSection} words unless the conversation has no content for it.`,
+			'',
+			'## 1. Primary Request and Intent',
+			'What is the user working on? What is the overall goal? What triggered this conversation?',
+			'',
+			'## 2. Key Technical Concepts',
+			'List every technical concept, architecture pattern, data structure, API, and library discussed. Include specific names.',
+			'',
+			'## 3. Files and Code Sections',
+			'For EACH file that was read, modified, or discussed:',
+			'- Full file path',
+			'- Why it is important / what role it plays',
+			'- What was learned from reading it (key functions, types, patterns found)',
+			'- What modifications were made (if any) and why',
+			'- Include specific function names, type names, variable names, and line ranges',
+			'',
+			'## 4. Errors and fixes',
+			'For each error encountered:',
+			'- The exact error message or symptom',
+			'- Root cause analysis',
+			'- The fix applied',
+			'',
+			'## 5. Problem Solving',
+			'Document the reasoning chain: what approaches were considered, which were chosen and why, what was rejected and why.',
+			'',
+			'## 6. All user messages',
+			'List every distinct request/instruction the user gave (paraphrase if long, quote if short).',
+			'',
+			'## 7. Pending Tasks',
+			'What is not yet done? What was discussed but not implemented?',
+			'',
+			'## 8. Current Work',
+			'Describe exactly what was being worked on immediately before this extraction.',
+			'',
+			'## 9. Optional Next Step',
+			'What is the most likely next action based on conversation context?',
+			'',
+			'CRITICAL: Write a LONG, detailed document. Do NOT summarize briefly. Include specific names, paths, and details.',
+			`Your output must be close to ${targetTokens.toLocaleString()} tokens. If a section has extensive content, write more. Do not truncate.`,
+		].join('\n')
+
+		// Send compaction as a normal chat continuation so the system prompt +
+		// conversation history hit the prefix cache. Only the summarization
+		// instruction at the end is new/uncached.
+		const compactionMessages: ChatMessage[] = [
+			...chatMessages,
+			{ role: 'user', content: summarizationPrompt, displayContent: '', selections: null } as ChatMessage,
+		]
+		const currentThread = this.state.allThreads[threadId]
+		const frozenAiInstructions = currentThread?.frozenAiInstructions
+		const manualCompaction = currentThread?.compactionSummary && currentThread?.compactionBoundaryIdx
+			? { summary: currentThread.compactionSummary, boundaryIdx: currentThread.compactionBoundaryIdx }
+			: undefined
+
+		const { overridesOfModel } = this._settingsService.state
+		const modelSelectionOptions = this._settingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
+
+		let systemMessageChars = 0
+		const sendCompactionFromChatMessages = async (chatMsgs: ChatMessage[], label: string) => {
+			const { messages: msgs, separateSystemMessage: sysMsg } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
+				chatMessages: chatMsgs,
+				modelSelection,
+				chatMode: 'agent',
+				frozenAiInstructions,
+				manualCompaction,
+			})
+			if (sysMsg) systemMessageChars = sysMsg.length
+			return new Promise<string>((resolve, reject) => {
+				this._llmMessageService.sendLLMMessage({
+					messagesType: 'chatMessages',
+					messages: msgs,
+					separateSystemMessage: sysMsg,
+					chatMode: null,
+					modelSelection,
+					modelSelectionOptions,
+					overridesOfModel,
+					onText: ({ usage }) => {
+						if (usage) this._setLatestUsage(threadId, usage)
+					},
+					onFinalMessage: ({ fullText, usage }) => {
+						if (usage) this._setLatestUsage(threadId, usage)
+						this._lockInCurrentRequestUsage(threadId)
+						resolve(fullText)
+					},
+					onError: (err) => { reject(new Error(err.message)) },
+					onAbort: () => { reject(new Error('Compaction aborted')) },
+					logging: { loggingName: label, loggingExtras: { threadId, compactPercent } },
+				})
+			})
+		}
+
+		// Block message input during compaction (same as running agent)
+		this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: '', reasoningSoFar: '', toolCallsSoFar: [] }, interrupt: Promise.resolve(() => { }) })
+
+		try {
+			const summary = await sendCompactionFromChatMessages(compactionMessages, 'Manual Compaction')
+
+			if (!summary || summary.trim().length === 0) {
+				return 'The model returned an empty summary.'
+			}
+
+			// Write compaction log for analysis
+			this._writeCompactionLog({
+				threadId,
+				compactPercent,
+				boundaryIdx,
+				totalMessages: chatMessages.length,
+				model: `${modelSelection.providerName}/${modelSelection.modelName}`,
+				inputTranscript: summarizationPrompt,
+				outputSummary: summary.trim(),
+				inputChars: compactableChars,
+				outputChars: summary.trim().length,
+				targetChars,
+			})
+
+			// saved = lastInputTokens - systemTokens - recentTokens - summaryTokens
+			const summaryTokens = Math.round(summary.trim().length / charsPerToken)
+			const lastInputTokens = this.latestUsageOfThreadId[threadId]?.inputTokens
+			let savedTokens: number
+			if (lastInputTokens && systemMessageChars > 0) {
+				let recentChars = 0
+				for (let i = boundaryIdx; i < chatMessages.length; i++) {
+					const m = chatMessages[i]
+					if (m.role === 'user') recentChars += (m.content?.length ?? 0)
+					else if (m.role === 'assistant') recentChars += (m.displayContent?.length ?? 0) + (m.reasoning?.length ?? 0)
+					else if (m.role === 'tool') {
+						recentChars += (m.rawParamsStr?.length ?? 0)
+						const r = m.result
+						if (typeof r === 'string') recentChars += r.length
+						else if (r && typeof r === 'object' && 'content' in r && typeof (r as { content?: string }).content === 'string') recentChars += ((r as { content: string }).content.length)
+					}
+				}
+				const recentTokens = Math.round(recentChars / charsPerToken)
+				const systemTokens = Math.round(systemMessageChars / charsPerToken)
+				savedTokens = Math.max(0, lastInputTokens - systemTokens - recentTokens - summaryTokens)
+			} else {
+				savedTokens = Math.max(0, Math.round((compactableChars - summary.trim().length) / charsPerToken))
+			}
+
+			const updatedThread: ThreadType = {
+				...thread,
+				lastModified: new Date().toISOString(),
+				compactionSummary: summary.trim(),
+				compactionBoundaryIdx: boundaryIdx,
+				compactionPercent: compactPercent,
+				compactionSavedTokens: savedTokens,
+			}
+			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
+			this._storeThread(threadId, updatedThread)
+			this._setState({ allThreads: newThreads })
+			return null
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e)
+			console.error('[Compaction] Failed:', e)
+			return msg
+		} finally {
+			this._setStreamState(threadId, undefined)
+		}
+	}
+
+	private _computeManualCompactionBoundary(messages: ChatMessage[], protectTurns: number, protectMessages: number): number {
+		let userCount = 0
+		let userTurnBoundary = 0
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i].role === 'user') {
+				userCount++
+				if (userCount >= protectTurns) {
+					userTurnBoundary = i
+					break
+				}
+			}
+		}
+		if (userCount < protectTurns) userTurnBoundary = 0
+
+		const messageCountBoundary = Math.max(0, messages.length - protectMessages)
+		return Math.max(userTurnBoundary, messageCountBoundary)
+	}
+
+	private _writeCompactionLog(opts: {
+		threadId: string, compactPercent: number, boundaryIdx: number,
+		totalMessages: number, model: string, inputTranscript: string,
+		outputSummary: string, inputChars: number, outputChars: number,
+		targetChars?: number,
+	}) {
+		const ts = new Date().toISOString().replace(/[:.]/g, '-')
+		const fileName = `compaction-${opts.threadId.slice(0, 8)}-${ts}.md`
+		const logDir = joinPath(this._environmentService.userRoamingDataHome, 'voidRequestLogs')
+		const logUri = joinPath(logDir, fileName)
+
+		const compressionActual = opts.inputChars > 0
+			? Math.round((1 - opts.outputChars / opts.inputChars) * 100)
+			: 0
+
+		const content = [
+			`# Compaction Log`,
+			``,
+			`## Settings`,
+			`- **Thread**: ${opts.threadId}`,
+			`- **Timestamp**: ${new Date().toISOString()}`,
+			`- **Model**: ${opts.model}`,
+			`- **Compression target**: ${opts.compactPercent}% (keep ~${100 - opts.compactPercent}%)`,
+			`- **Compression actual**: ${compressionActual}%`,
+			`- **Target chars**: ${(opts.targetChars ?? 0).toLocaleString()}`,
+			`- **Boundary index**: ${opts.boundaryIdx} / ${opts.totalMessages} messages`,
+			`- **Compactable region chars**: ${opts.inputChars.toLocaleString()}`,
+			`- **Output summary chars**: ${opts.outputChars.toLocaleString()}`,
+			``,
+			`## Output Summary`,
+			``,
+			opts.outputSummary,
+			``,
+			`## Input Transcript`,
+			``,
+			opts.inputTranscript,
+		].join('\n')
+
+		this._fileService.writeFile(logUri, VSBuffer.fromString(content)).catch(e => {
+			console.error('[Compaction] Failed to write log:', e)
+		})
+		console.log(`[Compaction] Log written to ${logUri.fsPath}`)
+	}
 
 	// ── Dev-only: perf testing helpers (see chatThreadDevTools.ts) ──────
 

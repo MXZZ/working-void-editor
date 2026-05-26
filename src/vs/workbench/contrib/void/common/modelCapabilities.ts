@@ -171,7 +171,7 @@ export type VoidStaticModelInfo = { // not stateful
 	supportsFIM: boolean; // whether the model was specifically designed for autocomplete or "FIM" ("fill-in-middle" format)
 	supportsVision?: boolean; // whether the model accepts image inputs (e.g. Gemini, GPT-4o, Claude)
 
-	additionalOpenAIPayload?: { [key: string]: string } // additional payload in the message body for requests that are openai-compatible (ollama, vllm, openai, openrouter, etc)
+	additionalOpenAIPayload?: { [key: string]: unknown } // additional payload in the message body for requests that are openai-compatible (ollama, vllm, openai, openrouter, etc)
 
 	// reasoning options
 	reasoningCapabilities: false | {
@@ -186,6 +186,11 @@ export type VoidStaticModelInfo = { // not stateful
 
 		// if it's open source and specifically outputs think tags, put the think tags here and we'll parse them out (e.g. ollama)
 		readonly openSourceThinkTags?: [string, string];
+
+		// whether to include reasoning_content on prior assistant messages when replaying conversation history.
+		// Required by DeepSeek V4 (their API returns 400 if omitted). Most providers ignore this field,
+		// so default is false to avoid sending unnecessary tokens.
+		readonly replayReasoningInHistory?: boolean;
 
 		// the only other field related to reasoning is "providerReasoningIOSettings", which varies by provider.
 	};
@@ -740,6 +745,7 @@ const openAISettings: VoidStaticProviderInfo = {
 	},
 	providerReasoningIOSettings: {
 		input: { includeInPayload: openAICompatIncludeInPayloadReasoning },
+		output: { nameOfFieldInDelta: ['reasoning_content', 'reasoning', 'thinking'] },
 	},
 }
 
@@ -965,7 +971,7 @@ const _deepseekV4SharedCaps = {
 	supportsFIM: false, // FIM only available outside thinking mode; we don't expose FIM for V4 chat
 	supportsSystemMessage: 'system-role',
 	specialToolFormat: 'openai-style',
-	reasoningCapabilities: { supportsReasoning: true, canTurnOffReasoning: true, canIOReasoning: true, reasoningSlider: { type: 'effort_slider', values: ['high', 'max'], default: 'high' } },
+	reasoningCapabilities: { supportsReasoning: true, canTurnOffReasoning: true, canIOReasoning: true, replayReasoningInHistory: true, reasoningSlider: { type: 'effort_slider', values: ['high', 'max'], default: 'high' } },
 	downloadable: false,
 } as const satisfies Partial<VoidStaticModelInfo>
 
