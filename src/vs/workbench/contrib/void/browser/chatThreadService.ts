@@ -1255,6 +1255,13 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			totalTokens: add(a.totalTokens, b.totalTokens),
 			reasoningTokens: add(a.reasoningTokens, b.reasoningTokens),
 			cachedInputTokens: add(a.cachedInputTokens, b.cachedInputTokens),
+			// Per-request timing: carry latest (summing is nonsensical)
+			ttftMs: b.ttftMs ?? a.ttftMs,
+			totalMs: b.totalMs ?? a.totalMs,
+			// Aggregatable counters: sum across requests
+			requestCount: add(a.requestCount, b.requestCount),
+			wallMs: add(a.wallMs, b.wallMs),
+			ttftMsSum: add(a.ttftMsSum, b.ttftMsSum),
 		}
 	}
 
@@ -2145,6 +2152,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				shouldRetryLLM = false
 				nAttempts += 1
 
+				// Per-request timing: TTFT = time from send to first non-empty
+				// token; total = time from send to onFinalMessage.
+				const requestStartMs = Date.now()
+				let firstTokenMs: number | undefined
+
 				type ResTypes =
 					| { type: 'llmDone', toolCalls: RawToolCallObj[], info: { fullText: string, fullReasoning: string, anthropicReasoning: AnthropicReasoning[] | null, finishReason?: string } }
 					| { type: 'llmError', error?: { message: string; fullError: Error | null; } }
@@ -2163,18 +2175,24 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					logging: { loggingName: `Chat - ${chatMode}`, loggingExtras: { threadId, nMessagesSent, chatMode } },
 					separateSystemMessage: separateSystemMessage,
 					onText: ({ fullText, fullReasoning, toolCalls, usage }) => {
-						if (usage) this._setLatestUsage(threadId, usage)
+						// Capture TTFT on the first non-empty token
+						if (firstTokenMs === undefined && (fullText || fullReasoning)) {
+							firstTokenMs = Date.now() - requestStartMs
+						}
+						if (usage) this._setLatestUsage(threadId, { ...usage, ttftMs: firstTokenMs })
 						// Coalesced fire (see _scheduleStreamTextUpdate). Final/transition
 						// state changes go through _setStreamState which cancels any
 						// pending update, so we cannot drop a meaningful end-state.
 						this._scheduleStreamTextUpdate(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: fullText, reasoningSoFar: fullReasoning, toolCallsSoFar: toolCalls ?? [] }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
 					},
 					onFinalMessage: async ({ fullText, fullReasoning, toolCalls, anthropicReasoning, usage, finishReason }) => {
+						const totalMs = Date.now() - requestStartMs
 						console.log(`[PrefixCache:final] thread=${threadId.slice(0, 8)} finishReason=${finishReason} fullReasoning.len=${fullReasoning?.length ?? 0} fullText.len=${fullText?.length ?? 0} toolCalls=${toolCalls?.length ?? 0} anthropicReasoning=${anthropicReasoning?.length ?? 0}`)
 						if (fullReasoning) console.log(`[PrefixCache:reasoning] "${fullReasoning}"`)
 						if (usage) {
-							console.log(`[PrefixCache:usage] thread=${threadId.slice(0, 8)} input=${usage.inputTokens} cached=${usage.cachedInputTokens} output=${usage.outputTokens} reasoning=${usage.reasoningTokens} total=${usage.totalTokens}`)
-							this._setLatestUsage(threadId, usage)
+							const usageWithTiming: LLMUsage = { ...usage, ttftMs: firstTokenMs, totalMs, requestCount: 1, wallMs: totalMs, ttftMsSum: firstTokenMs }
+							console.log(`[PrefixCache:usage] thread=${threadId.slice(0, 8)} input=${usage.inputTokens} cached=${usage.cachedInputTokens} output=${usage.outputTokens} reasoning=${usage.reasoningTokens} total=${usage.totalTokens} ttft=${firstTokenMs}ms total=${totalMs}ms`)
+							this._setLatestUsage(threadId, usageWithTiming)
 						}
 						// Lock in this request's usage so the next loop iteration's
 						// running total is added to (not replacing) what we already counted.
@@ -4172,7 +4190,6 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const { overridesOfModel } = this._settingsService.state
 		const modelSelectionOptions = this._settingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
 
-		let systemMessageChars = 0
 		const { chatMode } = this._settingsService.state.globalSettings
 		const sendCompactionFromChatMessages = async (chatMsgs: ChatMessage[], label: string) => {
 			const { messages: msgs, separateSystemMessage: sysMsg } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
@@ -4182,7 +4199,6 @@ We only need to do it for files that were edited since `from`, ie files between 
 				frozenAiInstructions,
 				manualCompaction,
 			})
-			if (sysMsg) systemMessageChars = sysMsg.length
 			return new Promise<string>((resolve, reject) => {
 				this._llmMessageService.sendLLMMessage({
 					messagesType: 'chatMessages',
@@ -4210,6 +4226,12 @@ We only need to do it for files that were edited since `from`, ie files between 
 		// Block message input during compaction (same as running agent)
 		this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: '', reasoningSoFar: '', toolCallsSoFar: [] }, interrupt: Promise.resolve(() => { }) })
 
+		// Save the pre-compaction usage so we can restore it after. The
+		// compaction request's usage overwrites latestUsage, but the user's
+		// "last request" stats should reflect their last normal chat turn,
+		// not the internal compaction operation.
+		const preCompactionLatestUsage = thread.latestUsage ? { ...thread.latestUsage } : undefined
+
 		try {
 			const summary = await sendCompactionFromChatMessages(compactionMessages, 'Manual Compaction')
 
@@ -4231,26 +4253,45 @@ We only need to do it for files that were edited since `from`, ie files between 
 				targetChars,
 			})
 
-			// saved = lastInputTokens - systemTokens - recentTokens - summaryTokens
+			// Per-turn savings = what the full conversation costs minus what
+			// the compacted conversation costs. We use the provider's actual
+			// inputTokens from the compaction request (which sent the full
+			// conversation + summarization prompt) and subtract the estimated
+			// cost of system + recent messages + summary + summarization prompt.
+			// This captures structural overhead (tool schemas, message framing)
+			// that char-count-based estimates miss — which is significant for
+			// tool-heavy conversations.
 			const summaryTokens = Math.round(summary.trim().length / charsPerToken)
+			const summarizationPromptTokens = Math.round(summarizationPrompt.length / charsPerToken)
 			const lastInputTokens = this.latestUsageOfThreadId[threadId]?.inputTokens
 			let savedTokens: number
-			if (lastInputTokens && systemMessageChars > 0) {
-				let recentChars = 0
-				for (let i = boundaryIdx; i < chatMessages.length; i++) {
-					const m = chatMessages[i]
-					if (m.role === 'user') recentChars += (m.content?.length ?? 0)
-					else if (m.role === 'assistant') recentChars += (m.displayContent?.length ?? 0) + (m.reasoning?.length ?? 0)
-					else if (m.role === 'tool') {
-						recentChars += (m.rawParamsStr?.length ?? 0)
-						const r = m.result
-						if (typeof r === 'string') recentChars += r.length
-						else if (r && typeof r === 'object' && 'content' in r && typeof (r as { content?: string }).content === 'string') recentChars += ((r as { content: string }).content.length)
+			if (lastInputTokens) {
+				// Estimate recent (post-boundary) tokens using the provider's
+				// real ratio rather than charsPerToken, so structural overhead
+				// is proportionally included.
+				const recentChars = (() => {
+					let n = 0
+					for (let i = boundaryIdx; i < chatMessages.length; i++) {
+						const m = chatMessages[i]
+						if (m.role === 'user') n += (m.content?.length ?? 0)
+						else if (m.role === 'assistant') n += (m.displayContent?.length ?? 0) + (m.reasoning?.length ?? 0)
+						else if (m.role === 'tool') {
+							n += (m.rawParamsStr?.length ?? 0)
+							const r = m.result
+							if (typeof r === 'string') n += r.length
+							else if (r && typeof r === 'object' && 'content' in r && typeof (r as { content?: string }).content === 'string') n += ((r as { content: string }).content.length)
+						}
 					}
-				}
-				const recentTokens = Math.round(recentChars / charsPerToken)
-				const systemTokens = Math.round(systemMessageChars / charsPerToken)
-				savedTokens = Math.max(0, lastInputTokens - systemTokens - recentTokens - summaryTokens)
+					return n
+				})()
+				// Derive the real chars→tokens ratio from the compaction request
+				// (sentChars ≈ compactableChars + recentChars + summarizationPrompt
+				// body chars). This ratio captures structural overhead that plain
+				// body-char counting misses.
+				const fullBodyChars = compactableChars + recentChars + summarizationPrompt.length
+				const realCharsPerToken = fullBodyChars / lastInputTokens
+				const recentTokens = Math.round(recentChars / realCharsPerToken)
+				savedTokens = Math.max(0, lastInputTokens - recentTokens - summarizationPromptTokens - summaryTokens)
 			} else {
 				savedTokens = Math.max(0, Math.round((compactableChars - summary.trim().length) / charsPerToken))
 			}
@@ -4274,6 +4315,12 @@ We only need to do it for files that were edited since `from`, ie files between 
 				compactionPercent: compactPercent,
 				compactionSavedTokens: savedTokens,
 			}
+			// Restore the pre-compaction latestUsage so the tooltip shows
+			// the user's last normal chat turn, not the compaction request.
+			if (preCompactionLatestUsage) {
+				updatedThread.latestUsage = preCompactionLatestUsage
+				this.latestUsageOfThreadId[threadId] = preCompactionLatestUsage
+			}
 			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread }
 			this._storeThread(threadId, updatedThread)
 			this._setState({ allThreads: newThreads })
@@ -4281,6 +4328,15 @@ We only need to do it for files that were edited since `from`, ie files between 
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e)
 			console.error('[Compaction] Failed:', e)
+			// Restore pre-compaction usage on error too, so a failed
+			// compaction doesn't leave stale stats.
+			if (preCompactionLatestUsage) {
+				const currentThread = this.state.allThreads[threadId]
+				if (currentThread) {
+					currentThread.latestUsage = preCompactionLatestUsage
+					this.latestUsageOfThreadId[threadId] = preCompactionLatestUsage
+				}
+			}
 			return msg
 		} finally {
 			this._setStreamState(threadId, undefined)

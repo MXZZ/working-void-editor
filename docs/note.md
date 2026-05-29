@@ -803,7 +803,35 @@ Deferred fixes (still not shipped; re-open only if symptoms return):
 - Fix: bake the directory listing into `compactionSummary` at compaction time (same pattern as normal chat bakes it into the first user message at send time). The summary user message is then stable across turns. Two cases:
   - No compaction: system + [directory+content user] + assistant + ...
   - Compaction: system + [directory+summary user] + [ack assistant] + ...
+- Also fixed compaction request using hardcoded `chatMode: 'agent'` instead of the thread's actual `chatMode`.
 - Files: `convertToLLMMessageService.ts`, `chatThreadService.ts`
+
+**Manual compaction `savedTokens` calculation fix** ✅ DONE
+- Problem: the `compactionSavedTokens` shown in the TokenUsageRing tooltip said "saved ~74k tokens per turn" when the actual per-turn savings were ~162-172k tokens (inputTokens dropped from 192k to 20-30k after compaction).
+- Root cause: the formula used `compactableChars / charsPerToken` to estimate the token cost of the compacted region. But `compactableChars` only counts message body content — it misses structural overhead (tool call schemas, message framing, role tokens) which is massive in tool-heavy conversations. A 192k-token conversation's body chars might only account for ~74k tokens worth of body text; the other ~118k is structural.
+- Fix: use the provider's actual `inputTokens` from the compaction request as the starting point, then subtract the post-boundary region, the summarization prompt, and the summary. The key insight: derive a real `charsPerToken` ratio from the compaction request (`fullBodyChars / inputTokens`) to convert recent body chars to tokens proportionally — this captures structural overhead that pure body-char counting misses.
+- Formula: `savedTokens = lastInputTokens - recentTokens - summarizationPromptTokens - summaryTokens`
+- Removed dead `systemMessageChars` variable.
+- Files: `chatThreadService.ts`
+
+**Manual compaction: preserve pre-compaction `latestUsage`** ✅ DONE
+- Problem: after compaction, the "last request" stats in the TokenUsageRing showed the compaction request's usage (which has no/low cache data) instead of the user's last normal chat turn.
+- Root cause: the compaction LLM call updates `_setLatestUsage` like a normal turn, overwriting `thread.latestUsage` with the compaction request's usage. This is misleading — the compaction is an internal operation, not a user-facing chat turn.
+- Fix: save `thread.latestUsage` before compaction starts, restore it after compaction completes (success or failure). The cumulative counters still include compaction tokens (the user was billed for them), but the "last request" line reflects the user's last normal turn.
+- Files: `chatThreadService.ts`
+
+**Request timing in usage stats** ✅ DONE
+- Added timing fields to `LLMUsage`: `ttftMs`, `totalMs`, `requestCount`, `wallMs`, `ttftMsSum`.
+- Captured in the normal chat loop: `requestStartMs` recorded before `sendLLMMessage`, `firstTokenMs` on first non-empty `onText` callback, `totalMs` on `onFinalMessage`.
+- `_addUsage` sums `requestCount`, `wallMs`, `ttftMsSum` cumulatively; carries latest for `ttftMs` and `totalMs`.
+- TokenUsageRing tooltip:
+  - **Last request**: `TTFT: Xms, Total: Xs`
+  - **Cumulative (turn/thread)**: `3 requests, avg TTFT: 1.2s, 8.5s`
+  - Output token rate shows both generation and effective: `Output: 5.2k (42 tok/s gen, 28 tok/s eff)`
+    - **gen** = `outputTokens / (wallMs - ttftMsSum)` — pure model throughput, excludes TTFT
+    - **eff** = `outputTokens / wallMs` — end-to-end rate the user experiences, includes TTFT
+- Known limitation: for existing threads, `wallMs` only accumulates from requests made after this change while `outputTokens` has full history — the rate will be inaccurate until enough new requests land. New threads are accurate from the start.
+- Files: `sendLLMMessageTypes.ts`, `chatThreadService.ts`, `SidebarChat.tsx`
 
 ### Next — Workspace-scoped chats (in progress, 5 commits)
 
