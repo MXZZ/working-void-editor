@@ -8,7 +8,7 @@ import { flushSync } from 'react-dom';
 
 
 
-import { useAccessor, useChatThreadsState, useChatThread, useCurrentWorkspaceUri, useChatThreadsStreamState, useStreamRunningState, useSettingsState, useActiveURI, useCommandBarState, useFullChatThreadsStreamState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction } from '../util/services.js';
+import { useAccessor, useChatThreadsState, useChatThread, useCurrentWorkspaceUri, useChatThreadsStreamState, useStreamRunningState, useSettingsState, useActiveURI, useCommandBarState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction, useAnyThreadRunning } from '../util/services.js';
 
 import { ChatMarkdownRender, ChatMessageLocation } from '../markdown/ChatMarkdownRender.js';
 import { URI } from '../../../../../../../base/common/uri.js';
@@ -1938,13 +1938,13 @@ const ReadOnlyForeignThreadBanner = ({ ownerLabel, isUnscoped, threadId }: { own
 const Checkpoint = ({ message, threadId, messageIdx, isCheckpointGhost, threadIsRunning }: { message: CheckpointEntry, threadId: string; messageIdx: number, isCheckpointGhost: boolean, threadIsRunning: boolean }) => {
 	const accessor = useAccessor()
 	const chatThreadService = accessor.get('IChatThreadService')
-	const streamState = useFullChatThreadsStreamState()
 
-	const isRunning = useChatThreadsStreamState(threadId)?.isRunning
+	const isRunning = useStreamRunningState(threadId)
+	const anyThreadRunning = useAnyThreadRunning()
 	const isDisabled = useMemo(() => {
 		if (isRunning) return true
-		return !!Object.keys(streamState).find((threadId2) => streamState[threadId2]?.isRunning)
-	}, [isRunning, streamState])
+		return anyThreadRunning
+	}, [isRunning, anyThreadRunning])
 
 	return <div
 		className={`flex items-center justify-center px-2 `}
@@ -2435,17 +2435,13 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	const threadIsReadOnly = isThreadReadOnly(thread, currentWorkspaceUri)
 	const compactionBoundaryIdx = thread?.compactionBoundaryIdx
 
-	const streamState = useChatThreadsStreamState(threadId)
-	const isRunning = streamState?.isRunning
-	const latestError = streamState?.error
-	const { displayContentSoFar, toolCallsSoFar, reasoningSoFar } = streamState?.llmInfo ?? {}
-	// During streaming the "currently being written" tool is the last one in the array
-	// (indices are emitted in order). Earlier tools in the batch may already be complete
-	// (their argument JSON fully streamed) but their persisted tool_request rows only
-	// show up in `thread.messages` once onFinalMessage fires and the batch is committed.
-	// For the live preview here we just show the latest in-flight tool.
-	const currentInFlightTool = toolCallsSoFar && toolCallsSoFar.length > 0 ? toolCallsSoFar[toolCallsSoFar.length - 1] : undefined
-	const toolIsGenerating = currentInFlightTool && !currentInFlightTool.isDone
+	// Only subscribe to isRunning transitions here — the full stream state
+	// (displayContentSoFar, toolCallsSoFar, etc.) is subscribed inside
+	// StreamingBubble, which is the only component that renders streaming
+	// content. This prevents ThreadMessagesView from re-rendering on every
+	// stream tick (~10Hz), which was the main source of UI freezes during
+	// LLM streaming.
+	const isRunning = useStreamRunningState(threadId)
 
 	const currCheckpointIdx = thread?.state?.currCheckpointIdx ?? undefined
 
@@ -2536,7 +2532,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		return lines * LINE_H + BUBBLE_PADDING
 	}, [])
 
-	const VIEWPORT_FILL_FACTOR = 3
+	const VIEWPORT_FILL_FACTOR = 5
 
 	// Two-phase initial mount:
 	// Phase 1: estimate heights from content, set mountStart in one shot
@@ -2792,7 +2788,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 					const mounted = totalCountRef.current - mountStartRef.current
 					const avgH = mounted > 0 ? (contentRef.current?.offsetHeight ?? el.scrollHeight) / mounted : 200
 					const msgsAbove = Math.floor(currScrollTop / avgH)
-					const msgsToKeepAbove = Math.ceil((el.clientHeight * 2) / avgH)
+					const msgsToKeepAbove = Math.ceil((el.clientHeight * 5) / avgH)
 					const msgsToRemove = msgsAbove - msgsToKeepAbove
 					if (msgsToRemove > 0) {
 						flushSync(() => setMountStart(prev => Math.min(prev + msgsToRemove, Math.max(0, totalCountRef.current - 1))))
@@ -2847,6 +2843,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			return cache.html
 		}
 
+		// Incremental append: same mountStart, just more messages at the end
 		if (depsMatch && previousMessages.length > cache.len) {
 			const newElements: React.ReactNode[] = []
 			for (let i = cache.len; i < previousMessages.length; i++) {
@@ -2871,7 +2868,47 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			return merged
 		}
 
-		// Full rebuild: mountStart changed, thread deps changed, etc.
+		// mountStart changed but messages array is the same — trim/extend
+		// at the edges instead of rebuilding everything. Keys stay the same
+		// for existing elements so React skips reconciliation on them.
+		const c = cache
+		if (c && c.msgs === previousMessages && previousMessages.length === c.len) {
+			const oldStart = c.mountStart
+			const newStart = mountStart
+			if (oldStart === newStart) {
+				return c.html
+			}
+
+			let result: React.ReactNode[]
+			if (newStart > oldStart) {
+				// Scrolled down — remove elements from the front
+				result = c.html.slice(newStart - oldStart)
+			} else {
+				// Scrolled up — prepend new elements at the front
+				const prefix: React.ReactNode[] = []
+				for (let i = newStart; i < oldStart; i++) {
+					prefix.push(<ChatBubble
+						key={i}
+						currCheckpointIdx={currCheckpointIdx}
+						chatMessage={previousMessages[i]}
+						messageIdx={i}
+						isCommitted={true}
+						chatIsRunning={undefined}
+						threadId={threadId}
+						_scrollToBottom={scrollToBottomCb}
+						firstPendingToolRequestIdx={firstPendingToolRequestIdx}
+						threadIsReadOnly={threadIsReadOnly}
+						compactionBoundaryIdx={compactionBoundaryIdx}
+					/>)
+				}
+				result = [...prefix, ...c.html]
+			}
+			c.html = result
+			c.mountStart = mountStart
+			return result
+		}
+
+		// Full rebuild: msgs reference changed (e.g. compaction, checkpoint)
 		const result: React.ReactNode[] = []
 		for (let i = mountStart; i < previousMessages.length; i++) {
 			result.push(<ChatBubble
@@ -2894,31 +2931,6 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	})()
 
 	const streamingChatIdx = previousMessages.length
-	const currStreamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?
-		<ChatBubble
-			key={streamingChatIdx}
-			currCheckpointIdx={currCheckpointIdx}
-			chatMessage={{
-				role: 'assistant',
-				displayContent: displayContentSoFar ?? '',
-				reasoning: reasoningSoFar ?? '',
-				anthropicReasoning: null,
-			}}
-			messageIdx={streamingChatIdx}
-			isCommitted={false}
-			chatIsRunning={isRunning}
-			threadId={threadId}
-			_scrollToBottom={null}
-			threadIsReadOnly={threadIsReadOnly}
-		/> : null
-
-	const generatingTool = toolIsGenerating && currentInFlightTool ?
-		currentInFlightTool.name === 'edit_file' || currentInFlightTool.name === 'rewrite_file' ? <EditToolSoFar
-			key={'curr-streaming-tool'}
-			toolCallSoFar={currentInFlightTool}
-		/>
-			: null
-		: null
 
 	return (
 		<div
@@ -2950,7 +2962,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 					w-full h-full
 					overflow-x-hidden
 					overflow-y-auto
-					${previousMessagesHTML.length === 0 && !displayContentSoFar ? 'hidden' : ''}
+					${previousMessagesHTML.length === 0 && !isRunning ? 'hidden' : ''}
 				`}
 				style={{ overflowAnchor: 'none' } as React.CSSProperties}
 			>
@@ -2959,28 +2971,85 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 						{previousMessagesHTML}
 					</div>
 				</div>
-				{currStreamingMessageHTML}
-				{generatingTool}
-
-				{isRunning === 'LLM' || isRunning === 'idle' && !toolIsGenerating ? <ProseWrapper>
-					{<IconLoading className='opacity-50 text-sm' />}
-				</ProseWrapper> : null}
-
-				{latestError === undefined ? null :
-					<div className='px-2 my-1'>
-						<ErrorDisplay
-							message={latestError.message}
-							fullError={latestError.fullError}
-							onDismiss={() => { chatThreadsService.dismissStreamError(threadId) }}
-							showDismiss={true}
-						/>
-
-						<WarningBox className='text-sm my-2 mx-4' onClick={() => { commandService.executeCommand(VOID_OPEN_SETTINGS_ACTION_ID) }} text='Open settings' />
-					</div>
-				}
+				<StreamingBubble
+					threadId={threadId}
+					streamingChatIdx={streamingChatIdx}
+					threadIsReadOnly={threadIsReadOnly}
+					isRunning={isRunning}
+				/>
 		</ScrollToBottomContainer>
 	</div>
 	)
+})
+
+
+// Isolated streaming bubble that subscribes to the full stream state
+// independently. This prevents ThreadMessagesView from re-rendering on
+// every stream tick (~10Hz). Only this component re-renders when the LLM
+// emits a new token; the message list above stays stable.
+const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOnly, isRunning }: {
+	threadId: string
+	streamingChatIdx: number
+	threadIsReadOnly: boolean
+	isRunning: ReturnType<typeof useStreamRunningState>
+}) => {
+	const streamState = useChatThreadsStreamState(threadId)
+	const accessor = useAccessor()
+	const chatThreadsService = accessor.get('IChatThreadService')
+	const commandService = accessor.get('ICommandService')
+
+	const latestError = streamState?.error
+	const { displayContentSoFar, toolCallsSoFar, reasoningSoFar } = streamState?.llmInfo ?? {}
+	const currentInFlightTool = toolCallsSoFar && toolCallsSoFar.length > 0 ? toolCallsSoFar[toolCallsSoFar.length - 1] : undefined
+	const toolIsGenerating = !!currentInFlightTool && !currentInFlightTool.isDone
+
+	const streamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?
+		<ChatBubble
+			key={streamingChatIdx}
+			currCheckpointIdx={undefined}
+			chatMessage={{
+				role: 'assistant',
+				displayContent: displayContentSoFar ?? '',
+				reasoning: reasoningSoFar ?? '',
+				anthropicReasoning: null,
+			}}
+			messageIdx={streamingChatIdx}
+			isCommitted={false}
+			chatIsRunning={isRunning}
+			threadId={threadId}
+			_scrollToBottom={null}
+			threadIsReadOnly={threadIsReadOnly}
+		/> : null
+
+	const generatingTool = toolIsGenerating && currentInFlightTool ?
+		currentInFlightTool.name === 'edit_file' || currentInFlightTool.name === 'rewrite_file' ? <EditToolSoFar
+			key={'curr-streaming-tool'}
+			toolCallSoFar={currentInFlightTool}
+		/>
+			: null
+		: null
+
+	return <>
+		{streamingMessageHTML}
+		{generatingTool}
+
+		{isRunning === 'LLM' || isRunning === 'idle' && !toolIsGenerating ? <ProseWrapper>
+			{<IconLoading className='opacity-50 text-sm' />}
+		</ProseWrapper> : null}
+
+		{latestError === undefined ? null :
+			<div className='px-2 my-1'>
+				<ErrorDisplay
+					message={latestError.message}
+					fullError={latestError.fullError}
+					onDismiss={() => { chatThreadsService.dismissStreamError(threadId) }}
+					showDismiss={true}
+				/>
+
+				<WarningBox className='text-sm my-2 mx-4' onClick={() => { commandService.executeCommand(VOID_OPEN_SETTINGS_ACTION_ID) }} text='Open settings' />
+			</div>
+		}
+	</>
 })
 
 

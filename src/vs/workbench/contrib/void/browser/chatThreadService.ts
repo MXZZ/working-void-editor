@@ -32,7 +32,7 @@ import { IEditCodeService } from './editCodeServiceInterface.js';
 import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
-import { LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, PINNED_THREADS_STORAGE_KEY, THREAD_INDEX_KEY, THREAD_KEY_PREFIX, THREAD_STORAGE_KEY } from '../common/storageKeys.js';
+import { LAST_ACTIVE_THREAD_BY_WORKSPACE_STORAGE_KEY, MESSAGE_KEY_PREFIX, PINNED_THREADS_STORAGE_KEY, THREAD_INDEX_KEY, THREAD_KEY_PREFIX, THREAD_STORAGE_KEY, USAGE_KEY_PREFIX } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { IRequestTelemetryService } from './requestTelemetryService.js';
 import { RunOnceScheduler, timeout } from '../../../../base/common/async.js';
@@ -896,10 +896,84 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	private readonly _pendingThreadWrites = new Map<string, ThreadType>()
 	private _storeThreadFlushScheduler: RunOnceScheduler | null = null
 
+	// ── Split storage: metadata / usage / messages ────────────────────
+	//
+	// Each thread uses three categories of storage keys:
+	//
+	//   void.chatThread.<id>  — static metadata (compaction summary,
+	//     title, workspace, frozen instructions, etc.). Written on user
+	//     actions and compaction — never during streaming.
+	//
+	//   void.chatUsage.<id>   — frequently-changing stats (latestUsage,
+	//     cumulativeUsage, lastModified, compactionSavedTokens). Written
+	//     at ~5Hz during streaming. Always small (~200 bytes).
+	//
+	//   void.chatMsg.<id>.<n> — individual message at index n. Written
+	//     on append (O(1)), edit (O(1)), truncate (delete removed keys).
+	//     Read on load by iterating from 0 until missing key (all
+	//     in-memory Map lookups — no IPC per key).
+	//
+	// Key wins vs old single-blob approach:
+	//  - Metadata updates (~5Hz) only serialize ~200 bytes (usage stats),
+	//    not the compaction summary or messages
+	//  - _addMessageToThread writes one new key, not the entire array
+	//  - Compaction only touches the metadata key, zero message keys
+
+	private _pendingUsageWrites = new Map<string, object>()       // usage stats
+	private _pendingMessageKeyWrites = new Map<string, ChatMessage>() // individual msg keys
+
+	// Which fields go in which key. Static metadata is written rarely
+	// (user actions, compaction). Usage is written at ~5Hz during
+	// streaming. Messages are written on append/edit/truncate.
+	private static readonly _USAGE_FIELDS = new Set([
+		'latestUsage', 'cumulativeUsageThisThread',
+		'latestCompaction', 'cumulativeCompactionThisThread',
+		'compactionSavedTokens', 'lastModified',
+	])
+
+	// Write only the usage key. Used by _setLatestUsage during streaming
+	// so metadata (compaction summary, etc.) is never re-serialized.
+	private _storeUsage(threadId: string, thread: ThreadType) {
+		const { usage } = this._splitThreadForStorage(thread)
+		this._pendingUsageWrites.set(threadId, usage)
+		if (!this._storeThreadFlushScheduler) {
+			this._storeThreadFlushScheduler = new RunOnceScheduler(() => this._flushPendingThreadWrites(), 500)
+			this._register(this._storeThreadFlushScheduler)
+		}
+		if (!this._storeThreadFlushScheduler.isScheduled()) {
+			this._storeThreadFlushScheduler.schedule()
+		}
+	}
+
+	private _splitThreadForStorage(thread: ThreadType): { metadata: object, usage: object } {
+		const metadata: Record<string, unknown> = {}
+		const usage: Record<string, unknown> = {}
+		for (const [key, value] of Object.entries(thread)) {
+			if (key === 'messages') continue
+			if (ChatThreadService._USAGE_FIELDS.has(key)) {
+				usage[key] = value
+			} else {
+				metadata[key] = value
+			}
+		}
+		return { metadata, usage }
+	}
+
 	private _storeThread(threadId: string, thread: ThreadType | undefined, updateIndex = false) {
 		if (thread === undefined) {
 			this._pendingThreadWrites.delete(threadId)
+			this._pendingUsageWrites.delete(threadId)
+			// Remove all storage keys for this thread
 			this._storageService.remove(THREAD_KEY_PREFIX + threadId, StorageScope.APPLICATION)
+			this._storageService.remove(USAGE_KEY_PREFIX + threadId, StorageScope.APPLICATION)
+			// Remove individual message keys. We don't know the count, so
+			// iterate until missing key. Since storage is in-memory, this
+			// is just Map lookups — fast even for thousands of messages.
+			for (let i = 0; ; i++) {
+				const key = MESSAGE_KEY_PREFIX + threadId + '.' + i
+				if (this._storageService.get(key, StorageScope.APPLICATION) === undefined) break
+				this._storageService.remove(key, StorageScope.APPLICATION)
+			}
 			this._writeThreadIndex({ removed: threadId })
 			return
 		}
@@ -916,12 +990,82 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 	}
 
-	private _flushPendingThreadWrites() {
-		if (this._pendingThreadWrites.size === 0) return
-		for (const [id, thread] of this._pendingThreadWrites) {
-			this._storageService.store(THREAD_KEY_PREFIX + id, JSON.stringify(thread), StorageScope.APPLICATION, StorageTarget.USER)
+	// Write an individual message key. Called by _addMessageToThread,
+	// _editMessageInThread, etc.
+	private _storeMessageKey(threadId: string, msgIdx: number, message: ChatMessage) {
+		this._pendingMessageKeyWrites.set(threadId + '.' + msgIdx, message)
+		if (!this._storeThreadFlushScheduler) {
+			this._storeThreadFlushScheduler = new RunOnceScheduler(() => this._flushPendingThreadWrites(), 500)
+			this._register(this._storeThreadFlushScheduler)
 		}
+		if (!this._storeThreadFlushScheduler.isScheduled()) {
+			this._storeThreadFlushScheduler.schedule()
+		}
+	}
+
+	// Delete message keys from fromIdx onward (for truncate/rollback).
+	private _deleteMessageKeysFrom(threadId: string, fromIdx: number) {
+		for (let i = fromIdx; ; i++) {
+			const key = MESSAGE_KEY_PREFIX + threadId + '.' + i
+			if (this._storageService.get(key, StorageScope.APPLICATION) === undefined) break
+			this._storageService.remove(key, StorageScope.APPLICATION)
+		}
+		// Also remove any pending writes for deleted keys
+		for (const k of this._pendingMessageKeyWrites.keys()) {
+			if (k.startsWith(threadId + '.')) {
+				const idx = parseInt(k.slice(threadId.length + 1), 10)
+				if (idx >= fromIdx) this._pendingMessageKeyWrites.delete(k)
+			}
+		}
+	}
+
+	// Write all messages for a thread (used after truncation/mutation
+	// where multiple keys change). Deletes stale keys beyond new length.
+	private _storeAllMessageKeys(threadId: string, messages: ChatMessage[]) {
+		this._deleteMessageKeysFrom(threadId, messages.length)
+		for (let i = 0; i < messages.length; i++) {
+			this._pendingMessageKeyWrites.set(threadId + '.' + i, messages[i])
+		}
+		if (!this._storeThreadFlushScheduler) {
+			this._storeThreadFlushScheduler = new RunOnceScheduler(() => this._flushPendingThreadWrites(), 500)
+			this._register(this._storeThreadFlushScheduler)
+		}
+		if (!this._storeThreadFlushScheduler.isScheduled()) {
+			this._storeThreadFlushScheduler.schedule()
+		}
+	}
+
+	private _flushPendingThreadWrites() {
+		if (this._pendingThreadWrites.size === 0 && this._pendingUsageWrites.size === 0 && this._pendingMessageKeyWrites.size === 0) return
+
+		// Split each thread into metadata + usage and write separately.
+		// Usage-only writes from _storeUsage take precedence (they're
+		// always more recent since they happen during streaming).
+		for (const [id, thread] of this._pendingThreadWrites) {
+			if (!this._pendingUsageWrites.has(id)) {
+				const { metadata, usage } = this._splitThreadForStorage(thread as ThreadType)
+				this._storageService.store(THREAD_KEY_PREFIX + id, JSON.stringify(metadata), StorageScope.APPLICATION, StorageTarget.USER)
+				this._storageService.store(USAGE_KEY_PREFIX + id, JSON.stringify(usage), StorageScope.APPLICATION, StorageTarget.USER)
+			} else {
+				// Usage was written separately — only write metadata here
+				const { metadata } = this._splitThreadForStorage(thread as ThreadType)
+				this._storageService.store(THREAD_KEY_PREFIX + id, JSON.stringify(metadata), StorageScope.APPLICATION, StorageTarget.USER)
+			}
+		}
+
+		// Flush usage-only writes (from _storeUsage during streaming)
+		for (const [id, usage] of this._pendingUsageWrites) {
+			this._storageService.store(USAGE_KEY_PREFIX + id, JSON.stringify(usage), StorageScope.APPLICATION, StorageTarget.USER)
+		}
+
+		// Write individual message keys
+		for (const [key, message] of this._pendingMessageKeyWrites) {
+			this._storageService.store(MESSAGE_KEY_PREFIX + key, JSON.stringify(message), StorageScope.APPLICATION, StorageTarget.USER)
+		}
+
 		this._pendingThreadWrites.clear()
+		this._pendingUsageWrites.clear()
+		this._pendingMessageKeyWrites.clear()
 	}
 
 	private _writeThreadIndex(delta?: { added?: string, removed?: string }) {
@@ -933,9 +1077,49 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	}
 
 	private _readThread(threadId: string): ThreadType | undefined {
-		const raw = this._storageService.get(THREAD_KEY_PREFIX + threadId, StorageScope.APPLICATION)
-		if (!raw) return undefined
-		return JSON.parse(raw, ChatThreadService._storageReviver) as ThreadType
+		const metadataRaw = this._storageService.get(THREAD_KEY_PREFIX + threadId, StorageScope.APPLICATION)
+		if (!metadataRaw) return undefined
+
+		// Migration: old format has messages array inline in metadata
+		const metadataParsed = JSON.parse(metadataRaw, ChatThreadService._storageReviver) as any
+		if (metadataParsed.messages && Array.isArray(metadataParsed.messages)) {
+			const thread = metadataParsed as ThreadType
+			// Write individual message keys
+			for (let i = 0; i < thread.messages.length; i++) {
+				this._storageService.store(MESSAGE_KEY_PREFIX + threadId + '.' + i, JSON.stringify(thread.messages[i]), StorageScope.APPLICATION, StorageTarget.USER)
+			}
+			// Split and rewrite metadata + usage without messages
+			const { metadata, usage } = this._splitThreadForStorage(thread)
+			this._storageService.store(THREAD_KEY_PREFIX + threadId, JSON.stringify(metadata), StorageScope.APPLICATION, StorageTarget.USER)
+			this._storageService.store(USAGE_KEY_PREFIX + threadId, JSON.stringify(usage), StorageScope.APPLICATION, StorageTarget.USER)
+			return thread
+		}
+
+		// New format — read metadata + usage + individual messages
+		const usageRaw = this._storageService.get(USAGE_KEY_PREFIX + threadId, StorageScope.APPLICATION)
+		const usageParsed = usageRaw ? JSON.parse(usageRaw, ChatThreadService._storageReviver) as any : {}
+
+		// Read messages by iterating from 0 until missing key.
+		// Storage is backed by an in-memory Map, so each get() is ~0.0001ms.
+		const messages: ChatMessage[] = []
+		for (let i = 0; ; i++) {
+			const msgRaw = this._storageService.get(MESSAGE_KEY_PREFIX + threadId + '.' + i, StorageScope.APPLICATION)
+			if (msgRaw === undefined) break
+			messages.push(JSON.parse(msgRaw, ChatThreadService._storageReviver) as ChatMessage)
+		}
+
+		// Ensure state exists (may be missing if metadata was written by
+		// an earlier version that excluded it from the metadata key)
+		const thread: ThreadType = { ...metadataParsed, ...usageParsed, messages } as ThreadType
+		if (!thread.state) {
+			thread.state = {
+				currCheckpointIdx: null,
+				stagingSelections: [],
+				focusedMessageIdx: undefined,
+				linksOfMessageIdx: {},
+			}
+		}
+		return thread
 	}
 
 	private _readAllThreadsSplit(): ChatThreads | null {
@@ -1178,8 +1362,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// which forced a full React re-render of the assistant bubble (full marked
 	// re-lex of the entire message + Monaco editor work for code blocks). That
 	// saturated the renderer's main thread, causing input lag (queued Enter
-	// keypresses) and visible UI freezes. We coalesce to ~20Hz here, which is
-	// indistinguishable from real-time visually but bounds per-chunk render cost.
+	// keypresses) and visible UI freezes. We coalesce to ~5Hz here (200ms),
+	// which is indistinguishable from real-time visually but bounds per-chunk
+	// render cost — especially important for threads with 1000+ messages where
+	// each render cycle is more expensive.
 	private readonly _streamTextThrottle = new Map<string, { scheduler: RunOnceScheduler; pending: ThreadStreamState[string] | null }>()
 
 	private _scheduleStreamTextUpdate(threadId: string, state: ThreadStreamState[string]) {
@@ -1192,7 +1378,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				e.pending = null
 				this.streamState[threadId] = pending
 				this._onDidChangeStreamState.fire({ threadId })
-			}, 100)
+			}, 200)
 			entry = { scheduler, pending: state }
 			this._streamTextThrottle.set(threadId, entry)
 		} else {
@@ -1225,7 +1411,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (thread) {
 			thread.latestUsage = usage
 			thread.cumulativeUsageThisThread = this.cumulativeUsageThisThreadOfThreadId[threadId]
-			this._storeThread(threadId, thread)
+			// Only write the usage key — don't re-serialize metadata
+			// (compaction summary, title, etc.) on every stream tick.
+			this._storeUsage(threadId, thread)
 		}
 		this._onDidChangeStreamState.fire({ threadId })
 	}
@@ -2105,47 +2293,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				return
 			}
 
-			// Prefix-cache investigation log: dump each message's role, char length,
-			// content hash, and cumulative hash so we can spot where the prefix diverges
-			// between turns. The cumulative hash represents the byte-identical prefix
-			// up to (and including) that message — if it matches the previous turn's
-			// cumulative hash at the same index, the provider can reuse its KV cache.
-			{
-				const djb2 = (s: string): string => {
-					let h = 5381
-					for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0
-					return (h >>> 0).toString(16).padStart(8, '0')
-				}
-				const msgContent = (m: typeof messages[number]): string => {
-					if ('content' in m) {
-						const c = m.content
-						if (typeof c === 'string') return c
-						if (Array.isArray(c)) return c.map(p => {
-							if ('text' in p && typeof p.text === 'string') return p.text
-							if ('content' in p && typeof p.content === 'string') return p.content
-							if ('type' in p) return `[${p.type}]`
-							return ''
-						}).join('|')
-					}
-					if ('parts' in m) return m.parts.map(p => 'text' in p && typeof p.text === 'string' ? p.text : '[part]').join('|')
-					return ''
-				}
-				let cumStr = ''
-				const sysMsg = separateSystemMessage || ''
-				if (sysMsg) cumStr += sysMsg
-				const lines: string[] = []
-				if (sysMsg) lines.push(`  [sys] len=${sysMsg.length} hash=${djb2(sysMsg)} cumHash=${djb2(cumStr)}`)
-				for (let i = 0; i < messages.length; i++) {
-					const m = messages[i]
-					const role = ('role' in m) ? (m as { role: string }).role : '?'
-					const content = msgContent(m)
-					cumStr += content
-					const preview = content.slice(0, 60).replace(/\n/g, '\\n')
-					lines.push(`  [${i}] ${role} len=${content.length} hash=${djb2(content)} cumHash=${djb2(cumStr)} "${preview}..."`)
-				}
-				console.log(`[PrefixCache] thread=${threadId.slice(0, 8)} turn=${nMessagesSent} msgs=${messages.length} totalChars=${sentChars}\n${lines.join('\n')}`)
-			}
-
 			let shouldRetryLLM = true
 			let nAttempts = 0
 			while (shouldRetryLLM) {
@@ -2187,11 +2334,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					},
 					onFinalMessage: async ({ fullText, fullReasoning, toolCalls, anthropicReasoning, usage, finishReason }) => {
 						const totalMs = Date.now() - requestStartMs
-						console.log(`[PrefixCache:final] thread=${threadId.slice(0, 8)} finishReason=${finishReason} fullReasoning.len=${fullReasoning?.length ?? 0} fullText.len=${fullText?.length ?? 0} toolCalls=${toolCalls?.length ?? 0} anthropicReasoning=${anthropicReasoning?.length ?? 0}`)
-						if (fullReasoning) console.log(`[PrefixCache:reasoning] "${fullReasoning}"`)
 						if (usage) {
 							const usageWithTiming: LLMUsage = { ...usage, ttftMs: firstTokenMs, totalMs, requestCount: 1, wallMs: totalMs, ttftMsSum: firstTokenMs }
-							console.log(`[PrefixCache:usage] thread=${threadId.slice(0, 8)} input=${usage.inputTokens} cached=${usage.cachedInputTokens} output=${usage.outputTokens} reasoning=${usage.reasoningTokens} total=${usage.totalTokens} ttft=${firstTokenMs}ms total=${totalMs}ms`)
 							this._setLatestUsage(threadId, usageWithTiming)
 						}
 						// Lock in this request's usage so the next loop iteration's
@@ -2426,6 +2570,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				...oldThread.messages.slice(messageIdx + 1, Infinity),
 			],
 		}
+		// Write the changed message key
+		this._storeMessageKey(threadId, messageIdx, newMessage)
 		const newThreads = { ...allThreads, [threadId]: updatedThread }
 		this._storeThread(threadId, updatedThread)
 		this._setState({ allThreads: newThreads })
@@ -2970,6 +3116,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 				messages: newMessages,
 			};
 			const newThreads = { ...this.state.allThreads, [threadId]: updatedThread };
+			this._storeAllMessageKeys(threadId, newMessages);
 			this._storeThread(threadId, updatedThread);
 			this._setState({ allThreads: newThreads });
 
@@ -3003,6 +3150,8 @@ We only need to do it for files that were edited since `from`, ie files between 
 		// clear messages up to the index
 		const slicedMessages = thread.messages.slice(0, messageIdx)
 		const removedMessages = thread.messages.slice(messageIdx)
+		this._deleteMessageKeysFrom(thread.id, messageIdx)
+		this._storeThread(thread.id, { ...thread, messages: slicedMessages })
 		this._setState({
 			allThreads: {
 				...this.state.allThreads,
@@ -3709,6 +3858,7 @@ We only need to do it for files that were edited since `from`, ie files between 
 			cumulativeCompactionThisThread: undefined,
 		}
 		const newThreads = { ...this.state.allThreads, [newId]: cloned }
+		this._storeAllMessageKeys(newId, cloned.messages)
 		this._storeThread(newId, cloned, true)
 		// Drop in-memory telemetry mirrors for the new id (defensive — should
 		// be empty since the id is fresh, but keeps the maps strictly
@@ -3885,12 +4035,17 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const { allThreads } = this.state
 		const oldThread = allThreads[threadId]
 		if (!oldThread) return // should never happen
+		const msgIdx = oldThread.messages.length
 		const updatedThread = {
 			...oldThread,
 			lastModified: new Date().toISOString(),
 			messages: [...oldThread.messages, message],
 		}
 		const newThreads = { ...allThreads, [threadId]: updatedThread }
+		// Write individual key for the new message + mark blob for
+		// re-serialization. The blob is the fast-read cache; the
+		// individual key is for crash recovery.
+		this._storeMessageKey(threadId, msgIdx, message)
 		this._storeThread(threadId, updatedThread)
 		this._setState({ allThreads: newThreads })
 	}
@@ -3990,20 +4145,24 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
 
+		const newMessages = thread.messages.map((m, i) =>
+			i === messageIdx && m.role === 'user' ? {
+				...m,
+				state: {
+					...m.state,
+					...state
+				},
+			} : m
+		)
+		// Only the one changed message needs a new key
+		this._storeMessageKey(threadId, messageIdx, newMessages[messageIdx])
+		this._storeThread(threadId, { ...thread, messages: newMessages })
 		this._setState({
 			allThreads: {
 				...this.state.allThreads,
 				[threadId]: {
 					...thread,
-					messages: thread.messages.map((m, i) =>
-						i === messageIdx && m.role === 'user' ? {
-							...m,
-							state: {
-								...m.state,
-								...state
-							},
-						} : m
-					)
+					messages: newMessages
 				}
 			}
 		})

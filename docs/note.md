@@ -154,11 +154,11 @@ const { reasoning, display } = getStreamContent({ repetitions: 3 })
   defeating `React.memo` on every stream update.
 - **Tool call preview streaming** (`EditToolChildren`): Passes `isStreaming` so the incremental lexer
   is used for the chat-side code preview during `edit_file` / `rewrite_file` tool calls.
-- **Stream throttle**: Bumped from 50ms → 100ms to give the editor more main-thread budget.
-- **Per-thread storage** (`chatThreadService.ts`): Each thread is stored under its own SQLite key
-  (`void.chatThread.{id}`) instead of a single blob for all threads. Saving one thread no longer
-  re-serializes the entire map. A lightweight index key (`void.chatThreadIndex`) stores the list
-  of thread IDs. Automatic one-time migration splits the old blob on first load.
+- **Stream throttle**: Bumped from 50ms → 200ms (via 100ms intermediate) to give the editor more main-thread budget.
+- **Per-thread storage** (`chatThreadService.ts`): Each thread is stored under its own key
+  instead of a single blob for all threads. A lightweight index key (`void.chatThreadIndex`)
+  stores the list of thread IDs. Automatic one-time migration splits the old blob on first load.
+  (See three-way split below for the current format.)
 - **Granular stream subscriptions** (`services.tsx`): Added `useStreamRunningState` hook that only
   re-renders when the `isRunning` status transitions (e.g. idle→LLM→idle), not on every content
   tick. `SidebarChat` and `CommandBarInChat` switched from `useChatThreadsStreamState` (fires every
@@ -226,14 +226,68 @@ const { reasoning, display } = getStreamContent({ repetitions: 3 })
   `unknown`. Enables telemetry analysis to differentiate e.g. "agent needs more context" from "agent
   has stale file content" without parsing error message strings.
 
+- **Chat virtualization** (`SidebarChat.tsx`): `ThreadMessagesView` implements window-based
+  virtualization — only messages within ~5x viewport height are mounted. Scrolling down trims
+  messages from the top (`setMountStart`), scrolling up expands. The initial fill mounts
+  `VIEWPORT_FILL_FACTOR=5` viewport heights of messages so the chat is scrollable on load.
+  The trim buffer is also 5x viewport, so trimming happens less frequently during normal scrolling.
+- **Lightweight code blocks** (`inputs.tsx`): Replaced Monaco `CodeEditorWidget` + `ITextModel`
+  with `<pre><code>` for chat code blocks. Monaco editors were being created/destroyed on every
+  virtualization scroll cycle — each creation fires `onModelAdded` → VS Code services process
+  each model → 589ms long tasks → Chromium creates thread pool workers that are never destroyed.
+  The lightweight version costs zero overhead on scroll. Removed `LazyBlockCode`'s
+  IntersectionObserver, height locking, and mount rate-limiting queue (unnecessary without Monaco).
+- **Lightweight diff display** (`inputs.tsx`): Replaced Monaco `DiffEditorWidget` + 2 models per
+  diff block with plain text original/modified display. Same rationale as code blocks — creating
+  DiffEditorWidgets on scroll was a major source of thread and memory growth.
+- **Lightweight terminal output** (`ToolResultComponents.tsx`): Replaced xterm.js terminal
+  attachment for `run_command` results with plain text `<pre>`. Running commands show a
+  placeholder instead of attaching a terminal instance.
+- **Model ref leak fix** (`editCodeService.ts`): Removed `voidModelService.initializeModel()` from
+  the `onModelAdded` handler — it created permanent refs in `_modelRefOfURI` for every model
+  including throwaway chat code block models. Replaced all `voidModelService.getModel(uri)` calls
+  with `modelService.getModel(uri)` (synchronous registry lookup, no ref creation). Added
+  `Schemas.inMemory` and `isForSimpleWidget` filters to skip chat code block models in all Void
+  `onModelAdded` listeners. Added `onModelRemoved` cleanup for `registeredModelURIs` sets.
+- **Auto model release on diff deletion** (`editCodeService.ts`): `_removeDiffAreaFromId` checks
+  if `diffAreasOfURI[uri.fsPath].size === 0` after removing a diff area, and calls
+  `releaseModel(uri)` automatically. Replaces the old `_releaseModelIfNoDiffZones` — every
+  `delete this.diffAreaOfId[...]` now goes through `_removeDiffAreaFromId`, so release is guaranteed.
+- **`withModel` for read-only tool access** (`voidModelService.ts`): New method that wraps model
+  access in a callback — `withModel(uri, ({ model }) => { ... })`. The model ref is automatically
+  released when the callback returns. Replaces manual `getModel` + `releaseModel` pairs in
+  `toolsService.ts` stringifiers. Impossible to forget the release.
+- **`isForSimpleWidget` filters** (`editCodeService.ts`, `voidCommandBarService.ts`,
+  `contextGatheringService.ts`): All Void `onModelAdded` listeners skip models with
+  `isForSimpleWidget` or `inmemory://` URIs, preventing chat code block models from
+  triggering full VS Code service activation. (Chat code blocks no longer create models
+  at all — see lightweight code blocks above — but the filters remain as a safety net.)
+- **Incremental virtualization rebuild** (`SidebarChat.tsx`): When `mountStart` changes during
+  scroll, existing chat bubbles are sliced/prepended instead of rebuilding all from scratch.
+  Messages with the same `key` are reused by React without unmounting, reducing DOM churn.
+- **StreamingBubble isolation** (`SidebarChat.tsx`): Extracted streaming content into a
+  `StreamingBubble` component that independently subscribes to `useChatThreadsStreamState`.
+  `ThreadMessagesView` only subscribes to `useStreamRunningState` (fires on start/stop, not
+  every token). Prevents ~5Hz re-renders of the entire message list during streaming.
+  `Checkpoint` and `SidebarThreadSelector` similarly switched to `useAnyThreadRunning` /
+  `useRunningThreadIds` — they now only re-render when `isRunning` transitions, not every token.
+- **Stream throttle increase** (`chatThreadService.ts`): Bumped from 100ms (10Hz) to 200ms (5Hz).
+  Visually indistinguishable but halves render cost during streaming.
+- **Three-way thread storage split** (`chatThreadService.ts`): Each thread uses three storage
+  categories: `void.chatThread.<id>` (static metadata — compaction summary, title, workspace,
+  state; written on user actions/compaction, never during streaming), `void.chatUsage.<id>`
+  (frequently-changing stats — latestUsage, cumulativeUsage, lastModified; ~200 bytes, written
+  at ~5Hz during streaming), `void.chatMsg.<id>.<n>` (individual message at index n; O(1)
+  append, O(1) edit, delete-removed-keys truncate). Key wins: usage updates only serialize
+  ~200 bytes instead of the full thread; `_addMessageToThread` writes one key instead of
+  re-serializing the entire messages array; compaction only writes the metadata key. Auto-migrates
+  from old inline format on first read.
+
 ### Known performance issues
 
-- **Resize / tab-switch with long chats**: Large DOM tree from fully-rendered messages causes
-  expensive reflow. `content-visibility: auto` breaks `scrollTop = scrollHeight` scroll-to-bottom.
-  Potential fixes: progressive rendering (render recent messages first, older ones in idle frames),
-  or full message-level virtualization with an IntersectionObserver-based scroll mechanism.
-- **Editor slowdown during tool execution**: The actual file write / diff-apply path — separate from
-  the chat-side preview rendering. Needs investigation.
+- **Thread growth from IPC**: Each LLM streaming token arrives via IPC from the main process.
+  Chromium creates IO thread pool workers to handle the burst, and these are never destroyed.
+  This causes gradual thread growth during active chat sessions. Not fixable from JavaScript.
 
 ## Build
 
@@ -844,6 +898,12 @@ Deferred fixes (still not shipped; re-open only if symptoms return):
 - Fix (bidirectional unmount): `LazyBlockCode` now unmounts Monaco when the block scrolls away (downgrades to `<pre><code>` placeholder) and re-mounts on re-entry. Height is locked during transitions to prevent scroll jumps. A `requestAnimationFrame` check handles the case where the element is already out of viewport when the observer starts (e.g., streaming just ended). This caps live Monacos to the viewport count (~5-10) instead of growing unboundedly.
 - Fix (model disposal): `BlockCode`'s dispose callback now disposes the text model and removes it from `modelOfEditorId`, releasing language workers and associated resources.
 - Files: `inputs.tsx`
+
+**VoidModelService model lifecycle — release after read-only tools** ✅ DONE
+- Problem: `VoidModelService._modelRefOfURI` kept every model reference forever. Each `initializeModel` call creates a model that registers with language services, spawning workers. In a typical agent session, `go_to_definition`/`go_to_usages` pre-initialized models for ALL target files (30+ per call for popular symbols), `read_file`/`search_in_file`/`read_lint_errors` each created a model, and none were ever released. This was the primary cause of OS thread growth (106+ threads).
+- Fix: added `releaseModel(uri)` to `VoidModelService` that disposes the model ref and removes it from `_modelRefOfURI`. Read-only tool stringifiers now call `releaseModel` after using the model (the stringifier is the last consumer). Write tools (`edit_file`, `rewrite_file`) keep their models since `editCodeService` needs them for diff tracking.
+- Fix: removed `go_to_definition`/`go_to_usages` target model pre-initialization. These tools only need target URI + line number for results; the stringifier falls back to `<preview unavailable>` when the model isn't loaded.
+- Files: `voidModelService.ts`, `toolsService.ts`
 
 ### Next — Workspace-scoped chats (in progress, 5 commits)
 

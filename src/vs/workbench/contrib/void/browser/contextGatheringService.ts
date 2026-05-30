@@ -50,12 +50,11 @@ class ContextGatheringService extends Disposable implements IContextGatheringSer
 	}
 
 	private _subscribeToModel(model: ITextModel): void {
-		console.log('Subscribing to model:', model.uri.toString());
+		if (model.isForSimpleWidget) return
 		this._register(model.onDidChangeContent(() => {
 			const editor = this._codeEditorService.getFocusedCodeEditor();
 			if (editor && editor.getModel() === model) {
 				const pos = editor.getPosition();
-				console.log('updateCache called at position:', pos);
 				if (pos) {
 					this.updateCache(model, pos);
 				}
@@ -72,7 +71,6 @@ class ContextGatheringService extends Disposable implements IContextGatheringSer
 
 		// Convert to array and filter overlapping snippets
 		this._cache = Array.from(snippets);
-		console.log('Cache updated:', this._cache);
 	}
 
 	public getCachedSnippets(): string[] {
