@@ -1035,47 +1035,12 @@ const CompactDialog = ({ onConfirm, onCancel }: { onConfirm: (percent: number, p
 
 const scrollToBottom = (divRef: { current: HTMLElement | null }) => {
 	if (divRef.current) {
-		divRef.current.scrollTop = 1e10;
+		const el = divRef.current
+		el.scrollTop = el.scrollHeight - el.clientHeight
 	}
 };
 
 
-
-const ScrollToBottomContainer = ({ children, className, style, scrollContainerRef }: { children: React.ReactNode, className?: string, style?: React.CSSProperties, scrollContainerRef: React.MutableRefObject<HTMLDivElement | null> }) => {
-	const isAtBottomRef = useRef(true);
-
-	const divRef = scrollContainerRef
-
-	const onScroll = useCallback(() => {
-		const div = divRef.current;
-		if (!div) return;
-
-		isAtBottomRef.current = Math.abs(
-			div.scrollHeight - div.clientHeight - div.scrollTop
-		) < 40;
-	}, [divRef]);
-
-	useEffect(() => {
-		if (isAtBottomRef.current) {
-			scrollToBottom(divRef);
-		}
-	}, [children]);
-
-	useEffect(() => {
-		scrollToBottom(divRef);
-	}, []);
-
-	return (
-		<div
-			ref={divRef}
-			onScroll={onScroll}
-			className={className}
-			style={style}
-		>
-			{children}
-		</div>
-	);
-};
 
 export { getRelative, getFolderName, getBasename } from './sidebarChatHelpers.js';
 
@@ -2445,16 +2410,6 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 
 	const currCheckpointIdx = thread?.state?.currCheckpointIdx ?? undefined
 
-	// Scroll to bottom when this view becomes active (on initial mount AND on
-	// re-activation after being hidden). Native scrollTop is preserved while
-	// hidden, but new messages may have streamed in while the user was on
-	// another thread, so landing-at-bottom on return keeps UX consistent with
-	// the previous single-thread behavior.
-	useEffect(() => {
-		if (isActive) {
-			scrollToBottom(scrollContainerRef)
-		}
-	}, [isActive, scrollContainerRef])
 
 	// Index of the "currently awaiting approval" tool request — the earliest of the
 	// consecutive trailing tool_request messages. Matches _getPendingBatchTools() in
@@ -2492,6 +2447,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 	const contentRef = useRef<HTMLDivElement | null>(null)
 	const spacerHeightRef = useRef(0)
 	const lastScrollTopRef = useRef(0)
+	const isAtBottomRef = useRef(true)
 
 	const getContentHeight = useCallback(() => {
 		return contentRef.current?.offsetHeight ?? 0
@@ -2508,119 +2464,69 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		return Math.max(1, Math.ceil(px / avg))
 	}, [getAvgHeight])
 
-	const estimateMsgHeight = useCallback((msg: ChatMessage, containerWidth: number): number => {
-		const LINE_H = 22
-		const CHAR_W = 7.2
-		const BUBBLE_PADDING = 32
-		const charsPerLine = Math.max(1, Math.floor(containerWidth / CHAR_W))
+	const VIEWPORT_FILL_FACTOR = 3
 
-		let text = ''
-		if (msg.role === 'assistant') {
-			text = (msg.displayContent || '') + (msg.reasoning || '')
-		} else if (msg.role === 'user') {
-			text = msg.content || ''
-		} else {
-			return 60
-		}
-		if (!text) return 40
-
-		let lines = 0
-		const parts = text.split('\n')
-		for (let i = 0; i < parts.length; i++) {
-			lines += Math.max(1, Math.ceil(parts[i].length / charsPerLine))
-		}
-		return lines * LINE_H + BUBBLE_PADDING
-	}, [])
-
-	const VIEWPORT_FILL_FACTOR = 5
-
-	// Two-phase initial mount:
-	// Phase 1: estimate heights from content, set mountStart in one shot
-	// Phase 2: after render, measure actual content, set spacer, scroll to bottom
+	// Single layout effect: measure actual content height, enforce the
+	// VIEWPORT_FILL_FACTOR invariant, set spacer, and compensate scroll.
+	// This runs on every mountStart/totalCount change — for initial fill,
+	// scrolling expand/trim, and new messages during streaming.
 	const initialFillDoneRef = useRef(false)
-	const estimationDoneRef = useRef(false)
-	const previousMessagesForEstimation = useRef(previousMessages)
-	previousMessagesForEstimation.current = previousMessages
+	const prevMountStartRef = useRef(mountStart)
+	const wasHiddenRef = useRef(true)
 	useLayoutEffect(() => {
-		if (initialFillDoneRef.current) return
-		const scrollEl = scrollContainerRef.current
-		if (!scrollEl || !isActive) return
-		if (scrollEl.clientHeight === 0) {
-			// Layout hasn't completed yet — retry after the browser
-			// paints. Without this, the initial fill never runs and
-			// only the last message is rendered (spacer stays wrong,
-			// chat appears stuck).
-			requestAnimationFrame(() => {
-				if (!initialFillDoneRef.current) setMountStart(prev => prev)
-			})
+		if (!isActive) {
+			wasHiddenRef.current = true
 			return
 		}
 
-		if (!estimationDoneRef.current) {
-			estimationDoneRef.current = true
-			const target = scrollEl.clientHeight * VIEWPORT_FILL_FACTOR
-			const containerW = scrollEl.clientWidth - 40
-			let estH = 0
-			let newMountStart = totalCount - 1
-			const msgs = previousMessagesForEstimation.current
-			for (let i = totalCount - 1; i >= 0; i--) {
-				estH += estimateMsgHeight(msgs[i], containerW)
-				newMountStart = i
-				if (estH >= target) break
-			}
-			if (newMountStart !== mountStart) {
-				setMountStart(newMountStart)
-				return
-			}
-		}
-
-		initialFillDoneRef.current = true
-		const contentH = getContentHeight()
-		spacerHeightRef.current = contentH
-		if (spacerRef.current) spacerRef.current.style.height = contentH + 'px'
-	}, [mountStart, totalCount, isActive, scrollContainerRef, getContentHeight, estimateMsgHeight])
-
-	// Sync wrapper height + scrollTop after expand or new messages.
-	// Expand (delta > 0): grow wrapper first, then adjust scrollTop.
-	const prevMountStartRef = useRef(mountStart)
-	useLayoutEffect(() => {
 		const scrollEl = scrollContainerRef.current
 		const spacerEl = spacerRef.current
 		if (!scrollEl || !spacerEl) return
+		if (scrollEl.clientHeight === 0) {
+			wasHiddenRef.current = true
+			return
+		}
+
+		const justActivated = wasHiddenRef.current
+		wasHiddenRef.current = false
+		if (justActivated) {
+			initialFillDoneRef.current = false
+		}
 
 		const contentH = getContentHeight()
-		const oldH = spacerHeightRef.current
-		const delta = contentH - oldH
+		const target = scrollEl.clientHeight * VIEWPORT_FILL_FACTOR
+
+		// Enforce 3-viewport invariant: if content is too short and there
+		// are unmounted messages above, expand mountStart by one message.
+		// The layout effect re-measures after each expansion.
+		if (contentH < target && mountStart > 0) {
+			setMountStart(mountStart - 1)
+			return
+		}
+
+		// Track content height for scroll compensation
+		const prevContentH = spacerHeightRef.current
+		spacerHeightRef.current = contentH
+
+		// Scroll compensation for mountStart changes (expand/trim)
 		const mountStartChanged = mountStart !== prevMountStartRef.current
 		prevMountStartRef.current = mountStart
 
-		if (Math.abs(delta) < 1) return
-
-		spacerHeightRef.current = contentH
-		spacerEl.style.height = contentH + 'px'
-
-		// Scroll compensation only after initial fill — before that the
-		// baseline is unreliable and compensation would misalign the
-		// viewport. During initial fill, just set the spacer height so
-		// content is visible; scrolling to bottom happens in the initial
-		// fill effect itself.
-		if (!initialFillDoneRef.current) return
-
-		if (mountStartChanged) {
-			if (delta > 0) {
-				scrollEl.scrollTop += delta
-			} else {
-				scrollEl.scrollTop += delta
-			}
+		if (!initialFillDoneRef.current) {
+			initialFillDoneRef.current = true
+			scrollToBottom(scrollContainerRef)
+		} else if (mountStartChanged) {
+			const delta = contentH - prevContentH
+			scrollEl.scrollTop += delta
 			lastScrollTopRef.current = scrollEl.scrollTop
 		} else {
-			const wasAtBottom = Math.abs(scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop) < 40
-			if (wasAtBottom) {
-				scrollEl.scrollTop = 1e10
+			// New message appended at the end — stay at bottom if we were there
+			if (isAtBottomRef.current) {
+				scrollToBottom(scrollContainerRef)
 			}
 			lastScrollTopRef.current = scrollEl.scrollTop
 		}
-	}, [mountStart, totalCount, scrollContainerRef, getContentHeight])
+	}, [mountStart, totalCount, isActive, scrollContainerRef, getContentHeight])
 
 	// ResizeObserver: sync wrapper height + scrollTop when content resizes
 	// (e.g., LaTeX rendering, LazyBlockCode placeholder → Monaco swap).
@@ -2636,11 +2542,17 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 		let prevWidth = scrollEl.clientWidth
 
 		const contentRo = new ResizeObserver(() => {
+			const contentH = contentEl.offsetHeight
+			const target = scrollEl.clientHeight * VIEWPORT_FILL_FACTOR
+
+			// Enforce 3-viewport invariant on resize (e.g. sidebar width change)
+			if (contentH < target && mountStartRef.current > 0) {
+				flushSync(() => setMountStart(Math.max(0, mountStartRef.current - 1)))
+				return
+			}
+
 			if (!initialFillDoneRef.current) {
-				// Still in initial fill — just sync height, no scroll compensation
-				const contentH = contentEl.offsetHeight
 				spacerHeightRef.current = contentH
-				spacerEl.style.height = contentH + 'px'
 				return
 			}
 
@@ -2648,20 +2560,15 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 			const widthChanged = currWidth !== prevWidth
 			prevWidth = currWidth
 
-			const contentH = contentEl.offsetHeight
 			const delta = contentH - spacerHeightRef.current
 			if (Math.abs(delta) < 1) return
 
 			spacerHeightRef.current = contentH
-			spacerEl.style.height = contentH + 'px'
 
 			if (!widthChanged) {
-				const distFromBottom = scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop
-				if (distFromBottom < 100) {
-					// Near bottom (streaming/just committed) — stay at bottom
-					scrollEl.scrollTop = scrollEl.scrollHeight
+				if (isAtBottomRef.current) {
+					scrollToBottom(scrollContainerRef)
 				} else {
-					// Scrolled away — compensate to keep viewport stable
 					scrollEl.scrollTop += delta
 				}
 				lastScrollTopRef.current = scrollEl.scrollTop
@@ -2671,6 +2578,20 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 
 		const scrollRo = new ResizeObserver(() => {
 			updateStickyQuestion(scrollEl)
+			// When the scroll container resizes (e.g. CommandBarInChat
+			// file-details panel opens/closes), the viewport height changes
+			// but contentRef didn't.
+			const contentH = contentEl.offsetHeight
+			const target = scrollEl.clientHeight * VIEWPORT_FILL_FACTOR
+			// Enforce 3-viewport invariant when viewport grows
+			if (contentH < target && mountStartRef.current > 0) {
+				flushSync(() => setMountStart(Math.max(0, mountStartRef.current - 1)))
+				return
+			}
+			// If was at bottom, snap back to bottom
+			if (isAtBottomRef.current) {
+				scrollToBottom(scrollContainerRef)
+			}
 		})
 		scrollRo.observe(scrollEl)
 
@@ -2769,6 +2690,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				const currScrollTop = el.scrollTop
 				const prevScrollTop = lastScrollTopRef.current
 				lastScrollTopRef.current = currScrollTop
+				isAtBottomRef.current = el.scrollHeight - el.clientHeight - currScrollTop < 100
 				const scrollingUp = currScrollTop < prevScrollTop
 				const scrollingDown = currScrollTop > prevScrollTop
 
@@ -2779,11 +2701,10 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 					return
 				}
 				if (scrollingDown && currScrollTop > el.clientHeight * 3) {
-					// Skip trim when near the bottom — auto-scroll from streaming
-					// triggers scroll-down events and trimming here would desync
-					// ScrollToBottomContainer's isAtBottomRef, breaking auto-scroll.
-					const distFromBottom = el.scrollHeight - el.clientHeight - currScrollTop
-					if (distFromBottom < 100) return
+					// Skip trim when we were at the bottom — auto-scroll
+					// triggers scroll-down events, trimming here would
+					// desync scroll position and break auto-scroll.
+					if (isAtBottomRef.current) return
 
 					const mounted = totalCountRef.current - mountStartRef.current
 					const avgH = mounted > 0 ? (contentRef.current?.offsetHeight ?? el.scrollHeight) / mounted : 200
@@ -2954,11 +2875,11 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				</div>
 				<div className='h-px w-full' style={{ background: 'linear-gradient(to right, transparent, var(--void-border-1), transparent)' }} />
 			</div>
-			<ScrollToBottomContainer
-				scrollContainerRef={scrollContainerRef}
+			<div
+				ref={scrollContainerRef}
 				className={`
 					flex flex-col
-					px-4 py-4 space-y-4
+					px-4 pt-4 pb-0
 					w-full h-full
 					overflow-x-hidden
 					overflow-y-auto
@@ -2966,7 +2887,7 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 				`}
 				style={{ overflowAnchor: 'none' } as React.CSSProperties}
 			>
-				<div ref={spacerRef} style={{ overflow: 'hidden', flexShrink: 0 }}>
+				<div ref={spacerRef} style={{ flexShrink: 0 }}>
 					<div ref={contentRef} data-virtualized-content className='flex flex-col space-y-4'>
 						{previousMessagesHTML}
 					</div>
@@ -2976,8 +2897,10 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 					streamingChatIdx={streamingChatIdx}
 					threadIsReadOnly={threadIsReadOnly}
 					isRunning={isRunning}
+					scrollContainerRef={scrollContainerRef}
+					isAtBottomRef={isAtBottomRef}
 				/>
-		</ScrollToBottomContainer>
+		</div>
 	</div>
 	)
 })
@@ -2987,16 +2910,29 @@ const ThreadMessagesView = React.memo(({ threadId, isActive, scrollContainerRef 
 // independently. This prevents ThreadMessagesView from re-rendering on
 // every stream tick (~10Hz). Only this component re-renders when the LLM
 // emits a new token; the message list above stays stable.
-const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOnly, isRunning }: {
+const StreamingBubble = React.memo(({ threadId, streamingChatIdx, threadIsReadOnly, isRunning, scrollContainerRef, isAtBottomRef }: {
 	threadId: string
 	streamingChatIdx: number
 	threadIsReadOnly: boolean
 	isRunning: ReturnType<typeof useStreamRunningState>
+	scrollContainerRef: React.MutableRefObject<HTMLDivElement | null>
+	isAtBottomRef: React.MutableRefObject<boolean>
 }) => {
 	const streamState = useChatThreadsStreamState(threadId)
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
 	const commandService = accessor.get('ICommandService')
+
+	// Auto-scroll to bottom on every stream tick if the user was at the
+	// bottom. Uses isAtBottomRef (set by the scroll handler) instead of
+	// checking live distance — content may have grown by more than 100px
+	// since the last scroll event, making the live check unreliable.
+	useLayoutEffect(() => {
+		if (isAtBottomRef.current) {
+			scrollToBottom(scrollContainerRef)
+			isAtBottomRef.current = true
+		}
+	})
 
 	const latestError = streamState?.error
 	const { displayContentSoFar, toolCallsSoFar, reasoningSoFar } = streamState?.llmInfo ?? {}
