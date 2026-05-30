@@ -290,22 +290,6 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			this._realignAllDiffAreasLines(uri, change.text, change.range)
 		}
 		this._refreshStylesAndDiffsInURI(uri)
-
-		// if diffarea has no diffs after a user edit, delete it
-		const diffAreasToDelete: DiffZone[] = []
-		for (const diffareaid of this.diffAreasOfURI[uri.fsPath] ?? []) {
-			const diffArea = this.diffAreaOfId[diffareaid] ?? null
-			const shouldDelete = diffArea?.type === 'DiffZone' && Object.keys(diffArea._diffOfId).length === 0
-			if (shouldDelete) {
-				diffAreasToDelete.push(diffArea)
-			}
-		}
-		if (diffAreasToDelete.length !== 0) {
-			const { onFinishEdit } = this._addToHistory(uri)
-			diffAreasToDelete.forEach(da => this._deleteDiffZone(da))
-			onFinishEdit()
-		}
-
 	}
 
 
@@ -793,15 +777,15 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		}
 
 		if (Object.keys(pendingSnapshotsOfURI).length === 0) {
-			this._storageService.remove(PENDING_DIFFS_STORAGE_KEY, StorageScope.APPLICATION)
+			this._storageService.remove(PENDING_DIFFS_STORAGE_KEY, StorageScope.WORKSPACE)
 			return
 		}
 
-		this._storageService.store(PENDING_DIFFS_STORAGE_KEY, JSON.stringify(pendingSnapshotsOfURI), StorageScope.APPLICATION, StorageTarget.USER)
+		this._storageService.store(PENDING_DIFFS_STORAGE_KEY, JSON.stringify(pendingSnapshotsOfURI), StorageScope.WORKSPACE, StorageTarget.USER)
 	}
 
 	private async _rehydratePendingDiffs(): Promise<void> {
-		const raw = this._storageService.get(PENDING_DIFFS_STORAGE_KEY, StorageScope.APPLICATION)
+		const raw = this._storageService.get(PENDING_DIFFS_STORAGE_KEY, StorageScope.WORKSPACE)
 		if (!raw) return
 
 		let parsed: unknown
@@ -1077,13 +1061,31 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		// 3. add Diffs
 		this._computeDiffsAndAddStylesToURI(uri)
 
-		// 4. refresh ctrlK zones
+		// 4. remove DiffZones that have no diffs (e.g. agent reverted its own edit)
+		this._deleteEmptyDiffZones(uri)
+
+		// 5. refresh ctrlK zones
 		this._refreshCtrlKInputs(uri)
 
-		// 5. this is the only place where diffs are changed, so can fire here only
+		// 6. this is the only place where diffs are changed, so can fire here only
 		this._fireChangeDiffsIfNotStreaming(uri)
 	}
 
+	/** Remove DiffZones whose _diffOfId is empty (all changes reverted). */
+	private _deleteEmptyDiffZones(uri: URI) {
+		const diffAreasToDelete: DiffZone[] = []
+		for (const diffareaid of this.diffAreasOfURI[uri.fsPath] ?? []) {
+			const diffArea = this.diffAreaOfId[diffareaid] ?? null
+			if (diffArea?.type === 'DiffZone' && Object.keys(diffArea._diffOfId).length === 0) {
+				diffAreasToDelete.push(diffArea)
+			}
+		}
+		if (diffAreasToDelete.length !== 0) {
+			const { onFinishEdit } = this._addToHistory(uri)
+			diffAreasToDelete.forEach(da => this._deleteDiffZone(da))
+			onFinishEdit()
+		}
+	}
 
 
 
