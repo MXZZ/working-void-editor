@@ -612,14 +612,16 @@ export class ToolsService implements IToolsService {
 				const totalLines = contentOfLine.length;
 				const regex = isRegex ? new RegExp(query) : null;
 				const lines: number[] = []
+				const lineContentOfLineNumber: Record<number, string> = {}
 				for (let i = 0; i < totalLines; i++) {
 					const line = contentOfLine[i];
 					if ((isRegex && regex!.test(line)) || (!isRegex && line.includes(query))) {
 						const matchLine = i + 1;
 						lines.push(matchLine);
+						lineContentOfLineNumber[matchLine] = line
 					}
 				}
-				return { result: { lines } };
+				return { result: { lines, lineContentOfLineNumber } };
 			},
 
 			go_to_definition: async ({ uri, symbolName, line }) => {
@@ -889,9 +891,9 @@ export class ToolsService implements IToolsService {
 					if (msg.role === 'user') {
 						return `${prefix} [USER]: ${(msg.displayContent || msg.content || '(empty)').slice(0, 500)}`
 					} else if (msg.role === 'assistant') {
-						const content = (msg.displayContent || '(empty)').slice(0, 500)
-						const reasoning = msg.reasoning ? `\n  Reasoning: ${msg.reasoning.slice(0, 300)}` : ''
-						return `${prefix} [ASSISTANT]: ${content}${reasoning}`
+						const content = msg.displayContent || msg.reasoning || '(empty)'
+						const reasoning = (!msg.displayContent && msg.reasoning) ? '' : msg.reasoning ? `\n  Reasoning: ${msg.reasoning.slice(0, 300)}` : ''
+						return `${prefix} [ASSISTANT]: ${content.slice(0, 500)}${reasoning}`
 					} else if (msg.role === 'tool') {
 						const paramsStr = JSON.stringify(msg.rawParams ?? {}).slice(0, 300)
 						const resultStr = ('result' in msg ? (typeof msg.result === 'string' ? msg.result : JSON.stringify(msg.result ?? {})) : '(no result yet)').slice(0, 500)
@@ -948,13 +950,11 @@ export class ToolsService implements IToolsService {
 				return result.uris.map(uri => uri.fsPath).join('\n') + nextPageStr(result.hasNextPage)
 			},
 			search_in_file: (params, result) => {
-				return voidModelService.withModel(params.uri, ({ model }) => {
-					if (!model) return '<Error getting string of result>'
-					return result.lines.map(n => {
-						const lineContent = model.getValueInRange({ startLineNumber: n, startColumn: 1, endLineNumber: n, endColumn: Number.MAX_SAFE_INTEGER }, EndOfLinePreference.LF)
-						return `Line ${n}:\n\`\`\`\n${lineContent}\n\`\`\``
-					}).join('\n\n');
-				})
+				const lineContentOfLineNumber = result?.lineContentOfLineNumber
+				return result.lines.map(n => {
+					const lineContent = lineContentOfLineNumber?.[n] ?? ''
+					return `Line ${n}:\n\`\`\`\n${lineContent}\n\`\`\``
+				}).join('\n\n')
 			},
 			go_to_definition: (params, result) => {
 				return voidModelService.withModel(params.uri, () => {
