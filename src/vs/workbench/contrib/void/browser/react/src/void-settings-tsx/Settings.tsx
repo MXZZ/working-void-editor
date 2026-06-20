@@ -7,7 +7,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useState, useR
 import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName, BackendId, BackendProtocol, BackendProviderSettings } from '../../../../common/voidSettingsTypes.js'
 import ErrorBoundary from '../sidebar-tsx/ErrorBoundary.js'
 import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidInputBox2, VoidSegmentedControl, VoidSimpleInputBox, VoidSwitch } from '../util/inputs.js'
-import { useAccessor, useIsDark, useIsOptedOut, useRefreshModelListener, useRefreshModelState, useSettingsState } from '../util/services.js'
+import { useAccessor, useIsDark, useIsOptedOut, useRefreshModelListener, useRefreshModelState, useSettingsState, useSemanticIndexState } from '../util/services.js'
 import { X, RefreshCw, Loader2, Check, Asterisk, Plus, GripVertical } from 'lucide-react'
 import { URI } from '../../../../../../../base/common/uri.js'
 import { ModelDropdown } from './ModelDropdown.js'
@@ -1434,6 +1434,108 @@ const MCPServersList = () => {
 	return <div className="my-2">{content}</div>
 };
 
+const SemanticSearchSettings = () => {
+	const accessor = useAccessor()
+	const voidSettingsService = accessor.get('IVoidSettingsService')
+	const settingsState = useSettingsState()
+	const indexState = useSemanticIndexState()
+
+	return <div className='w-full'>
+		<h4 className={`text-base`}>{displayInfoOfFeatureName('SemanticSearch')}</h4>
+		<div className='text-sm text-void-fg-3 mt-1'>Search code by meaning or intent, not exact string match. Requires an embedding model (e.g. text-embedding-3-small on OpenAI, nomic-embed-text on Ollama).</div>
+
+		<div className='my-2'>
+			{/* Enable Switch */}
+			<ErrorBoundary>
+				<div className='flex items-center gap-x-2 my-2'>
+					<VoidSwitch
+						size='xs'
+						value={settingsState.globalSettings.semanticSearchEnabled}
+						onChange={(newVal) => voidSettingsService.setGlobalSetting('semanticSearchEnabled', newVal)}
+					/>
+					<span className='text-void-fg-3 text-xs pointer-events-none'>{settingsState.globalSettings.semanticSearchEnabled ? 'Enabled' : 'Disabled'}</span>
+				</div>
+			</ErrorBoundary>
+
+			{/* Model Dropdown */}
+			<ErrorBoundary>
+				<div className={`my-2 ${!settingsState.globalSettings.semanticSearchEnabled ? 'hidden' : ''}`}>
+					<ModelDropdown featureName={'SemanticSearch'} className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-1 rounded p-0.5 px-1' />
+				</div>
+			</ErrorBoundary>
+
+			{/* Index Status */}
+			<ErrorBoundary>
+				{settingsState.globalSettings.semanticSearchEnabled && indexState.status !== 'idle' && (
+					<div className='text-xs text-void-fg-3 mt-1'>
+						{indexState.status === 'indexing' && (indexState.progress.indexed < 0 ? 'Scanning files...' : `Indexing ${indexState.progress.indexed}/${indexState.progress.total}`)}
+						{indexState.status === 'ready' && 'Index ready'}
+					</div>
+				)}
+			</ErrorBoundary>
+
+			{/* Advanced Settings */}
+			<ErrorBoundary>
+				{settingsState.globalSettings.semanticSearchEnabled && (
+					<div className='mt-2 space-y-1'>
+						<div className='text-xs text-void-fg-3 font-medium'>Advanced</div>
+						<div className='grid grid-cols-[auto_1fr] gap-x-2 gap-y-1 items-center text-xs'>
+							<span className='text-void-fg-3'>Dimensions</span>
+							<VoidSimpleInputBox
+								value={String(settingsState.globalSettings.semanticSearchDimensions ?? 1024)}
+								onChangeValue={(val) => voidSettingsService.setGlobalSetting('semanticSearchDimensions', parseInt(val) || 1024)}
+								placeholder='1024'
+								compact
+								className='max-w-20'
+							/>
+							<span className='text-void-fg-3'>Batch size</span>
+							<VoidSimpleInputBox
+								value={String(settingsState.globalSettings.semanticSearchBatchSize ?? 64)}
+								onChangeValue={(val) => voidSettingsService.setGlobalSetting('semanticSearchBatchSize', parseInt(val) || 64)}
+								placeholder='64'
+								compact
+								className='max-w-20'
+							/>
+							<span className='text-void-fg-3'>Concurrency</span>
+							<VoidSimpleInputBox
+								value={String(settingsState.globalSettings.semanticSearchConcurrency ?? 16)}
+								onChangeValue={(val) => voidSettingsService.setGlobalSetting('semanticSearchConcurrency', parseInt(val) || 16)}
+								placeholder='16'
+								compact
+								className='max-w-20'
+							/>
+							<span className='text-void-fg-3'>Chunk size</span>
+							<VoidSimpleInputBox
+								value={String(settingsState.globalSettings.semanticSearchChunkSize ?? 2400)}
+								onChangeValue={(val) => voidSettingsService.setGlobalSetting('semanticSearchChunkSize', parseInt(val) || 2400)}
+								placeholder='2400'
+								compact
+								className='max-w-20'
+							/>
+							<span className='text-void-fg-3'>Chunk overlap</span>
+							<VoidSimpleInputBox
+								value={String(settingsState.globalSettings.semanticSearchChunkOverlap ?? 200)}
+								onChangeValue={(val) => voidSettingsService.setGlobalSetting('semanticSearchChunkOverlap', parseInt(val) || 200)}
+								placeholder='200'
+								compact
+								className='max-w-20'
+							/>
+							<span className='text-void-fg-3'>Max file size</span>
+							<VoidSimpleInputBox
+								value={String(settingsState.globalSettings.semanticSearchMaxFileSize ?? 1000000)}
+								onChangeValue={(val) => voidSettingsService.setGlobalSetting('semanticSearchMaxFileSize', parseInt(val) || 1000000)}
+								placeholder='1000000'
+								compact
+								className='max-w-20'
+							/>
+						</div>
+					</div>
+				)}
+			</ErrorBoundary>
+		</div>
+	</div>
+}
+
 export const Settings = () => {
 	const isDark = useIsDark()
 	// ─── sidebar nav ──────────────────────────
@@ -1825,6 +1927,11 @@ export const Settings = () => {
 												</div>
 
 											</div>
+										</ErrorBoundary>
+
+										{/* Semantic Search */}
+										<ErrorBoundary>
+											<SemanticSearchSettings />
 										</ErrorBoundary>
 									</div>
 								</ErrorBoundary>

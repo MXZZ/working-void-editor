@@ -382,7 +382,7 @@ export const modelSelectionsEqual = (m1: ModelSelection, m2: ModelSelection) => 
 }
 
 // this is a state
-export const featureNames = ['Chat', 'Ctrl+K', 'Autocomplete', 'Apply', 'SCM', 'VisionHelper'] as const
+export const featureNames = ['Chat', 'Ctrl+K', 'Autocomplete', 'Apply', 'SCM', 'VisionHelper', 'SemanticSearch'] as const
 export type ModelSelectionOfFeature = Record<(typeof featureNames)[number], ModelSelection | null>
 export type FeatureName = keyof ModelSelectionOfFeature
 
@@ -400,6 +400,9 @@ export const displayInfoOfFeatureName = (featureName: FeatureName) => {
 	// source control:
 	else if (featureName === 'SCM')
 		return 'Commit Message Generator'
+	// semantic search:
+	else if (featureName === 'SemanticSearch')
+		return 'Semantic Search'
 	// vision:
 	else if (featureName === 'VisionHelper')
 		return 'Vision Helper'
@@ -482,6 +485,13 @@ export type GlobalSettings = {
 	autoAcceptLLMChanges: boolean;
 	autoOutlineReadFile: boolean;
 	rulesPaths: string;
+	semanticSearchEnabled: boolean;
+	semanticSearchDimensions: number;
+	semanticSearchBatchSize: number;
+	semanticSearchConcurrency: number;
+	semanticSearchChunkSize: number;
+	semanticSearchChunkOverlap: number;
+	semanticSearchMaxFileSize: number;
 }
 
 export const defaultGlobalSettings: GlobalSettings = {
@@ -500,6 +510,13 @@ export const defaultGlobalSettings: GlobalSettings = {
 	autoAcceptLLMChanges: false,
 	autoOutlineReadFile: true,
 	rulesPaths: '',
+	semanticSearchEnabled: true,
+	semanticSearchDimensions: 1024,
+	semanticSearchBatchSize: 64,
+	semanticSearchConcurrency: 16,
+	semanticSearchChunkSize: 2400,
+	semanticSearchChunkOverlap: 200,
+	semanticSearchMaxFileSize: 1_000_000,
 }
 
 export type GlobalSettingName = keyof GlobalSettings

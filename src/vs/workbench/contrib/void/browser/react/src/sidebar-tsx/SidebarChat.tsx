@@ -8,7 +8,7 @@ import { flushSync } from 'react-dom';
 
 
 
-import { useAccessor, useChatThreadsState, useChatThread, useCurrentWorkspaceUri, useChatThreadsStreamState, useStreamRunningState, useSettingsState, useActiveURI, useCommandBarState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction, useAnyThreadRunning } from '../util/services.js';
+import { useAccessor, useChatThreadsState, useChatThread, useCurrentWorkspaceUri, useChatThreadsStreamState, useStreamRunningState, useSettingsState, useActiveURI, useCommandBarState, useChatThreadLatestUsage, useChatThreadCumulativeUsage, useChatThreadCompaction, useAnyThreadRunning, useSemanticIndexState } from '../util/services.js';
 
 import { ChatMarkdownRender, ChatMessageLocation } from '../markdown/ChatMarkdownRender.js';
 import { URI } from '../../../../../../../base/common/uri.js';
@@ -3028,6 +3028,25 @@ const useRulesOutdated = (threadId: string, lastAppliedRules: string | undefined
 	return outdatedInfo
 }
 
+const SemanticIndexProgressLabel = () => {
+	const { status, progress } = useSemanticIndexState()
+	const settingsState = useSettingsState()
+
+	if (!settingsState.globalSettings.semanticSearchEnabled) return null
+	if (status !== 'indexing') return null
+
+	const label = progress.indexed < 0
+		? 'Scanning files...'
+		: `Indexing ${progress.indexed}/${progress.total}`
+
+	return (
+		<div className='flex items-center gap-1 text-xs text-void-fg-3 select-none'>
+			<IconLoading className='w-3 h-3' />
+			<span>{label}</span>
+		</div>
+	)
+}
+
 const RulesOutdatedBanner = ({ detectedAt }: { detectedAt: Date | null }) => {
 	const timeStr = detectedAt ? detectedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : null
 	return (
@@ -3415,6 +3434,7 @@ export const SidebarChat = () => {
 					</button>
 				)}
 				{!canCompact && !showCompactDialog && <div />}
+				<SemanticIndexProgressLabel />
 			</div>
 			{inputChatArea}
 		</div>
@@ -3422,6 +3442,10 @@ export const SidebarChat = () => {
 
 	const landingPageInput = <div>
 		<div className='pt-8'>
+			<div className='flex items-center justify-between mb-1 px-2'>
+				<div />
+				<SemanticIndexProgressLabel />
+			</div>
 			{inputChatArea}
 		</div>
 	</div>
