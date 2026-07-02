@@ -4,6 +4,7 @@ import { IFileService } from '../../../../platform/files/common/files.js'
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js'
 import { createDecorator, IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js'
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js'
+import { IPathService } from '../../../services/path/common/pathService.js'
 import { QueryBuilder } from '../../../services/search/common/queryBuilder.js'
 import { ISearchService } from '../../../services/search/common/search.js'
 import { IEditCodeService } from './editCodeServiceInterface.js'
@@ -358,6 +359,7 @@ export class ToolsService implements IToolsService {
 		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
 		@ILanguageFeaturesService languageFeaturesService: ILanguageFeaturesService,
 		@IFetchUrlService private readonly fetchUrlService: IFetchUrlService,
+		@IPathService private readonly pathService: IPathService,
 	) {
 		const queryBuilder = this.instantiationService.createInstance(QueryBuilder);
 
@@ -557,6 +559,12 @@ export class ToolsService implements IToolsService {
 				const contextRadiusRaw = validateNumber(contextRadiusUnknown, { default: 3 })
 				const contextRadius = Math.max(1, Math.min(contextRadiusRaw ?? 3, 10))
 				return { query, toolName, resultStatus, contextRadius }
+			},
+
+			load_skill: (params: RawToolParamsObj) => {
+				const { skill_name: skillNameUnknown } = params
+				const skillName = validateStr('skill_name', skillNameUnknown)
+				return { skillName }
 			},
 
 		}
@@ -967,6 +975,32 @@ export class ToolsService implements IToolsService {
 
 				return { result: { matches, totalMatches: matchIndices.length } }
 			},
+
+			load_skill: async ({ skillName }) => {
+				// Strip frontmatter and return body
+				const stripFrontmatter = (content: string) => {
+					const bodyMatch = content.match(/^---\s*\n[\s\S]*?\n---\s*\n([\s\S]*)$/)
+					return (bodyMatch ? bodyMatch[1] : content).trim()
+				}
+				// Try each candidate path: workspace .void/skills/ then global ~/.void/skills/
+				// Supports both <name>/SKILL.md (directory) and <name>.md (flat file)
+				const candidateUris: URI[] = []
+				for (const folder of workspaceContextService.getWorkspace().folders) {
+					candidateUris.push(URI.joinPath(folder.uri, '.void', 'skills', skillName, 'SKILL.md'))
+					candidateUris.push(URI.joinPath(folder.uri, '.void', 'skills', `${skillName}.md`))
+				}
+				const userHome = await this.pathService.userHome()
+				candidateUris.push(URI.joinPath(userHome, '.void', 'skills', skillName, 'SKILL.md'))
+				candidateUris.push(URI.joinPath(userHome, '.void', 'skills', `${skillName}.md`))
+
+				for (const uri of candidateUris) {
+					if (await fileService.exists(uri)) {
+						const content = (await fileService.readFile(uri)).value.toString()
+						return { result: { content: stripFrontmatter(content) } }
+					}
+				}
+				return { result: { content: `Skill "${skillName}" not found. Check the AVAILABLE SKILLS section for the correct name.` } }
+			},
 		}
 
 
@@ -1136,6 +1170,10 @@ export class ToolsService implements IToolsService {
 			search_history: (_params, result) => {
 				const totalStr = result.totalMatches > 20 ? ` (showing first 20 of ${result.totalMatches})` : ''
 				return `Found ${result.totalMatches} matching message(s)${totalStr}:\n\n${result.matches}`
+			},
+
+			load_skill: (_params, result) => {
+				return result.content
 			},
 		}
 
