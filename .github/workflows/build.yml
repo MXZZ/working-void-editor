@@ -18,9 +18,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-
       - name: Build Rust CLI
         run: |
           cd cli
@@ -33,9 +30,10 @@ jobs:
           cache: 'npm'
 
       - name: Install NPM dependencies
-        run: npm ci
-        env:
-          npm_config_msvs_version: 2022
+        run: |
+          # Use the standard VS 2022 path for GitHub Actions
+          $env:GYP_MSVS_VERSION = "2022"
+          npm ci
 
       - name: Compile Editor
         run: npm run compile
