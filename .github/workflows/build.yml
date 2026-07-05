@@ -18,17 +18,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Locate VC Directory
-        shell: pwsh
-        run: |
-          $vcPath = Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter "vc.exe" | Select-Object -First 1
-          if ($vcPath) {
-            $vcDir = $vcPath.Directory.FullName
-            echo "VCINSTALLDIR=$vcDir" >> $env:GITHUB_ENV
-          } else {
-            echo "Could not find vc.exe"
-            exit 1
-          }
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build Rust CLI
         run: |
@@ -44,7 +35,7 @@ jobs:
       - name: Install NPM dependencies
         run: npm ci
         env:
-          VCINSTALLDIR: ${{ env.VCINSTALLDIR }}
+          npm_config_msvs_version: 2022
 
       - name: Compile Editor
         run: npm run compile
