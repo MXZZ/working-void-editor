@@ -37,6 +37,7 @@ jobs:
       - name: Install NPM dependencies
         run: npm ci
         env:
+          GYP_MSVS_VERSION: 2022
           npm_config_msvs_version: 2022
 
       - name: Compile Editor
