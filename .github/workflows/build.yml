@@ -22,7 +22,6 @@ jobs:
       - name: Setup Build Tools
         run: |
           npm install -g node-gyp
-          npm config set msvs_version 2022
 
       - name: Build Rust CLI
         run: |
@@ -36,7 +35,7 @@ jobs:
           cache: 'npm'
 
       - name: Install NPM dependencies
-        run: npm ci
+        run: npm ci --msvs_version=2022
 
       - name: Compile Editor
         run: npm run compile
