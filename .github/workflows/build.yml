@@ -40,7 +40,7 @@ jobs:
           cargo build --release
 
       - name: Install NPM dependencies
-        run: npm install
+        run: npm ci
 
       - name: Compile Editor
         run: npm run compile
