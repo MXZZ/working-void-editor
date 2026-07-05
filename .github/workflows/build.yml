@@ -21,9 +21,9 @@ jobs:
       - name: Locate VC Directory
         shell: pwsh
         run: |
-          $vcPath = Get-ChildPath -Path "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter "vc.exe" | Select-Object -First 1
+          $vcPath = Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter "vc.exe" | Select-Object -First 1
           if ($vcPath) {
-            $vcDir = $vcPath.Directory.Parent.Parent.FullName
+            $vcDir = $vcPath.Directory.FullName
             echo "VCINSTALLDIR=$vcDir" >> $env:GITHUB_ENV
           } else {
             echo "Could not find vc.exe"
