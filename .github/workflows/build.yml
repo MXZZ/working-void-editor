@@ -11,12 +11,12 @@ jobs:
   build:
     name: Build on Windows
     runs-on: windows-latest
+    env:
+      GYP_MSVS_VERSION: 2022
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-
 
       - name: Build Rust CLI
         run: |
