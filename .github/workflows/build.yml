@@ -13,11 +13,15 @@ jobs:
     runs-on: windows-latest
     env:
       GYP_MSVS_VERSION: '2022'
+      # Setting this helps node-gyp bypass its broken discovery logic
       VCINSTALLDIR: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC'
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Setup MSVC Environment
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
