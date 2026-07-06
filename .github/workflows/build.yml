@@ -52,6 +52,11 @@ jobs:
           Set-Location cli
           cargo build --release
 
+      - name: Build Void React bundles
+        run: npm run buildreact
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+
       - name: Compile Editor
         run: npm run compile
 
