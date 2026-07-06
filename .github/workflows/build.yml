@@ -12,12 +12,15 @@ jobs:
     name: Build on Windows
     runs-on: windows-latest
     env:
-      GYP_MSVS_VERSION: 2022
-      VCINSTALLDIR: "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC"
+      GYP_MSVS_VERSION: '2022'
+      VCINSTALLDIR: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC'
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build Rust CLI
         run: |
@@ -55,4 +58,3 @@ jobs:
         with:
           name: binaries-windows
           path: artifacts/
-    
