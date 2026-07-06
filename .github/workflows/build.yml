@@ -11,11 +11,13 @@ jobs:
   build:
     name: Build on Windows
     runs-on: windows-latest
+    timeout-minutes: 120
     env:
       # windows-latest now ships VS 2026 (v18); node-gyp >= 12.1.0 (npm >= 11.6.3) is required
       GYP_MSVS_VERSION: '2026'
       npm_config_msvs_version: '2026'
       VCINSTALLDIR: 'C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC'
+      NODE_OPTIONS: --max-old-space-size=8192
 
     steps:
       - name: Checkout code
@@ -24,7 +26,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version-file: '.nvmrc'
           cache: 'npm'
 
       - name: Upgrade npm for VS 2026 / node-gyp compatibility
@@ -33,6 +35,11 @@ jobs:
 
       - name: Install NPM dependencies
         run: npm ci
+        env:
+          npm_config_foreground_scripts: 'true'
+
+      - name: Build Void React bundles
+        run: npm run buildreact
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -50,32 +57,51 @@ jobs:
           Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments '-arch=amd64'
 
           Set-Location cli
-          cargo build --release
+          cargo build --release --bin code
 
-      - name: Build Void React bundles
-        run: npm run buildreact
+      - name: Package Void for Windows
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path .build | Out-Null
+
+          npm run gulp vscode-win32-x64-min
+          npm run gulp vscode-win32-x64-inno-updater
+
+          $appDir = Join-Path (Split-Path $PWD -Parent) 'VSCode-win32-x64'
+          $tunnelExe = Join-Path $appDir 'bin/void-tunnel.exe'
+          New-Item -ItemType Directory -Force -Path (Split-Path $tunnelExe -Parent) | Out-Null
+          Copy-Item 'cli/target/release/code.exe' $tunnelExe -Force
+
+          npm run gulp vscode-win32-x64-user-setup
         env:
-          NODE_OPTIONS: --max-old-space-size=8192
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compile Editor
-        run: npm run compile
-
-      - name: Archive Rust CLI
-        shell: bash
+      - name: Stage release artifacts
+        shell: pwsh
         run: |
-          mkdir -p artifacts/cli
-          cp cli/target/release/*.exe artifacts/cli/ || true
+          $repoParent = Split-Path $PWD -Parent
+          $appDir = Join-Path $repoParent 'VSCode-win32-x64'
+          $setupDir = '.build/win32-x64/user-setup'
 
-      - name: Archive Editor Build
-        shell: bash
-        run: |
-          mkdir -p artifacts/editor
-          if [ -d "out" ]; then
-            cp -r out artifacts/editor/
-          fi
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+
+          if (Test-Path "$setupDir/VSCodeSetup.exe") {
+            Copy-Item "$setupDir/VSCodeSetup.exe" 'artifacts/VoidSetup.exe'
+            Write-Host "Staged installer: artifacts/VoidSetup.exe"
+          } else {
+            Write-Error "Installer not found at $setupDir/VSCodeSetup.exe"
+          }
+
+          if (Test-Path $appDir) {
+            Compress-Archive -Path $appDir -DestinationPath 'artifacts/void-win32-x64-portable.zip' -Force
+            Write-Host "Staged portable build: artifacts/void-win32-x64-portable.zip"
+          } else {
+            Write-Error "Portable app folder not found at $appDir"
+          }
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-windows
+          name: void-windows
           path: artifacts/
+          retention-days: 14
