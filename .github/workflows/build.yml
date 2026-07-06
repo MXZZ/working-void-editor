@@ -28,7 +28,8 @@ jobs:
           cache: 'npm'
 
       - name: Upgrade npm for VS 2026 / node-gyp compatibility
-        run: npm install -g npm@11.6.3
+        # >= 11.6.3 bundles node-gyp with VS 2026 support; 11.6.3 crashes on overrides (npm/cli#8757)
+        run: npm install -g npm@11.6.4
 
       - name: Install NPM dependencies
         run: npm ci
