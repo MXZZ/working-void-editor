@@ -13,6 +13,7 @@ jobs:
     runs-on: windows-latest
     env:
       GYP_MSVS_VERSION: 2022
+      VCINSTALLDIR: "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC"
 
     steps:
       - name: Checkout code
@@ -30,10 +31,7 @@ jobs:
           cache: 'npm'
 
       - name: Install NPM dependencies
-        run: |
-          # Use the standard VS 2022 path for GitHub Actions
-          $env:GYP_MSVS_VERSION = "2022"
-          npm ci
+        run: npm ci
 
       - name: Compile Editor
         run: npm run compile
