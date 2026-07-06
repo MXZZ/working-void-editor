@@ -62,12 +62,18 @@ jobs:
       - name: Package Void for Windows
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path .build | Out-Null
 
-          npm run gulp vscode-win32-x64-min
+          # Use non-min build: mangling conflicts with Void's npm deps (e.g. google-auth-library)
+          npm run gulp vscode-win32-x64
           npm run gulp vscode-win32-x64-inno-updater
 
           $appDir = Join-Path (Split-Path $PWD -Parent) 'VSCode-win32-x64'
+          if (-not (Test-Path $appDir)) {
+            throw "Expected packaged app at $appDir"
+          }
+
           $tunnelExe = Join-Path $appDir 'bin/void-tunnel.exe'
           New-Item -ItemType Directory -Force -Path (Split-Path $tunnelExe -Parent) | Out-Null
           Copy-Item 'cli/target/release/code.exe' $tunnelExe -Force
@@ -79,6 +85,7 @@ jobs:
       - name: Stage release artifacts
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $repoParent = Split-Path $PWD -Parent
           $appDir = Join-Path $repoParent 'VSCode-win32-x64'
           $setupDir = '.build/win32-x64/user-setup'
