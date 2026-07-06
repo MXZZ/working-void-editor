@@ -13,6 +13,7 @@ jobs:
     runs-on: windows-latest
     env:
       GYP_MSVS_VERSION: '2022'
+      npm_config_msvs_version: '2022'
       # This bypasses the node-gyp auto-discovery bug
       VCINSTALLDIR: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC'
 
@@ -25,9 +26,6 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
-
-      - name: Configure NPM
-        run: npm config set msvs_version 2022
 
       - name: Install NPM dependencies
         run: npm ci
