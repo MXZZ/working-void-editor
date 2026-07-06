@@ -12,10 +12,10 @@ jobs:
     name: Build on Windows
     runs-on: windows-latest
     env:
-      GYP_MSVS_VERSION: '2022'
-      npm_config_msvs_version: '2022'
-      # This bypasses the node-gyp auto-discovery bug
-      VCINSTALLDIR: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC'
+      # windows-latest now ships VS 2026 (v18); node-gyp >= 12.1.0 (npm >= 11.6.3) is required
+      GYP_MSVS_VERSION: '2026'
+      npm_config_msvs_version: '2026'
+      VCINSTALLDIR: 'C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC'
 
     steps:
       - name: Checkout code
@@ -26,6 +26,9 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
+
+      - name: Upgrade npm for VS 2026 / node-gyp compatibility
+        run: npm install -g npm@11.6.3
 
       - name: Install NPM dependencies
         run: npm ci
