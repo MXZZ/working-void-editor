@@ -20,6 +20,7 @@ import { CopyButton, EditToolAcceptRejectButtonsHTML, useEditToolStreamState } f
 import { ToolApprovalTypeSwitch } from '../void-settings-tsx/Settings.js';
 import { persistentTerminalNameOfId } from '../../../terminalToolService.js';
 import { removeMCPToolNamePrefix } from '../../../../common/mcpServiceTypes.js';
+import { toolDefinitionOfToolName } from '../../../tools/toolRegistry.js';
 
 import {
 	getBasename,
@@ -340,32 +341,6 @@ const loadingTitleWrapper = (item: React.ReactNode): React.ReactNode => {
 	</span>
 }
 
-export const titleOfBuiltinToolName = {
-	'read_file': { done: 'Read file', proposed: 'Read file', running: loadingTitleWrapper('Reading file') },
-	'ls_dir': { done: 'Inspected folder', proposed: 'Inspect folder', running: loadingTitleWrapper('Inspecting folder') },
-	'get_dir_tree': { done: 'Inspected folder tree', proposed: 'Inspect folder tree', running: loadingTitleWrapper('Inspecting folder tree') },
-	'search_pathnames_only': { done: 'Searched by file name', proposed: 'Search by file name', running: loadingTitleWrapper('Searching by file name') },
-	'search_for_files': { done: 'Searched', proposed: 'Search', running: loadingTitleWrapper('Searching') },
-	'create_file_or_folder': { done: `Created`, proposed: `Create`, running: loadingTitleWrapper(`Creating`) },
-	'delete_file_or_folder': { done: `Deleted`, proposed: `Delete`, running: loadingTitleWrapper(`Deleting`) },
-	'rename_file_or_folder': { done: `Renamed`, proposed: `Rename`, running: loadingTitleWrapper(`Renaming`) },
-	'edit_file': { done: `Edited file`, proposed: 'Edit file', running: loadingTitleWrapper('Editing file') },
-	'rewrite_file': { done: `Wrote file`, proposed: 'Write file', running: loadingTitleWrapper('Writing file') },
-	'run_command': { done: `Ran terminal`, proposed: 'Run terminal', running: loadingTitleWrapper('Running terminal') },
-	'run_persistent_command': { done: `Ran terminal`, proposed: 'Run terminal', running: loadingTitleWrapper('Running terminal') },
-
-	'open_persistent_terminal': { done: `Opened terminal`, proposed: 'Open terminal', running: loadingTitleWrapper('Opening terminal') },
-	'kill_persistent_terminal': { done: `Killed terminal`, proposed: 'Kill terminal', running: loadingTitleWrapper('Killing terminal') },
-
-	'read_lint_errors': { done: `Read lint errors`, proposed: 'Read lint errors', running: loadingTitleWrapper('Reading lint errors') },
-	'search_in_file': { done: 'Searched in file', proposed: 'Search in file', running: loadingTitleWrapper('Searching in file') },
-	'go_to_definition': { done: 'Found definition', proposed: 'Go to definition', running: loadingTitleWrapper('Finding definition') },
-	'go_to_usages': { done: 'Found usages', proposed: 'Go to usages', running: loadingTitleWrapper('Finding usages') },
-	'fetch_url': { done: 'Fetched URL', proposed: 'Fetch URL', running: loadingTitleWrapper('Fetching URL') },
-	'semantic_search': { done: 'Searched semantically', proposed: 'Search semantically', running: loadingTitleWrapper('Searching semantically') },
-	'search_history': { done: 'Searched history', proposed: 'Search history', running: loadingTitleWrapper('Searching history') },
-} as const satisfies Record<BuiltinToolName, { done: any, proposed: any, running: any }>
-
 
 // Prefix like "(1/2) " when this tool is part of a multi-tool batch emitted in one
 // assistant turn. The prefix is purely decorative (helps the user see that one reply
@@ -411,10 +386,11 @@ export const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name
 	// built-in title
 	else {
 		const toolName = t.name as BuiltinToolName
+		const title = toolDefinitionOfToolName[toolName]!.title
 		const base =
-			t.type === 'success' ? titleOfBuiltinToolName[toolName].done
-				: t.type === 'running_now' ? titleOfBuiltinToolName[toolName].running
-					: titleOfBuiltinToolName[toolName].proposed
+			t.type === 'success' ? title.done
+				: t.type === 'running_now' ? loadingTitleWrapper(title.running)
+					: title.proposed
 		return prefix ? `${prefix}${base}` : base
 	}
 }
@@ -561,6 +537,12 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 			const toolParams = _toolParams as BuiltinToolCallParams['search_history']
 			return {
 				desc1: toolParams.query ? `"${toolParams.query}"` : toolParams.toolName ? `tool: ${toolParams.toolName}` : '(search)',
+			}
+		},
+		'load_skill': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['load_skill']
+			return {
+				desc1: `"${toolParams.skillName}"`,
 			}
 		},
 		'go_to_usages': () => {
@@ -860,11 +842,14 @@ const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 		if (type === 'run_command')
 			componentParams.children = <div className='relative h-[300px] text-sm bg-void-bg-3 p-2 overflow-auto'><pre className='m-0 font-mono text-[13px] whitespace-pre text-void-fg-2'>Running command...</pre></div>
 	}
-	else if (toolMessage.type === 'rejected' || toolMessage.type === 'tool_request') {
+	else if (toolMessage.type === 'tool_request') {
+		componentParams.children = <ToolChildrenWrapper className='bg-void-bg-3'><pre className='m-0 font-mono text-[13px] whitespace-pre text-void-fg-2'>Pending...</pre></ToolChildrenWrapper>
+	}
+	else if (toolMessage.type === 'rejected') {
 	}
 
 	return <>
-		<ToolHeaderWrapper {...componentParams} isOpen={type === 'run_command' && (toolMessage.type === 'running_now' || toolMessage.type === 'success') ? true : undefined} />
+		<ToolHeaderWrapper {...componentParams} />
 	</>
 }
 
@@ -933,8 +918,9 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor);
 			const icon = null
 
-			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
 
 			const isError = false
 			const isRejected = toolMessage.type === 'rejected'
@@ -982,8 +968,9 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
 			const icon = null
 
-			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
 
 			const isError = false
 			const isRejected = toolMessage.type === 'rejected'
@@ -1030,8 +1017,9 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
 			const icon = null
 
-			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
 
 			const isError = false
 			const isRejected = toolMessage.type === 'rejected'
@@ -1085,8 +1073,9 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
 			const icon = null
 
-			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
 
 			const { rawParams, params } = toolMessage
 			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected, }
@@ -1134,8 +1123,9 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
 			const icon = null
 
-			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
 
 			const { rawParams, params } = toolMessage
 			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected, }
@@ -1189,8 +1179,9 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor);
 			const icon = null;
 
-			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
 
 			const { rawParams, params } = toolMessage;
 			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected };
@@ -1233,8 +1224,9 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
 			const icon = null
 
-			if (toolMessage.type === 'tool_request') return null
-			if (toolMessage.type === 'running_now') return null
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
 
 			const isError = false
 			const isRejected = toolMessage.type === 'rejected'
@@ -1271,8 +1263,9 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
 			const icon = null
 
-			if (toolMessage.type === 'tool_request') return null
-			if (toolMessage.type === 'running_now') return null
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
 
 			const isError = false
 			const isRejected = toolMessage.type === 'rejected'
@@ -1317,8 +1310,9 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
 			const icon = null
 
-			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
 
 			const isError = false
 			const isRejected = toolMessage.type === 'rejected'
@@ -1502,16 +1496,16 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const title = getTitle(toolMessage)
 			const icon = null
 
-			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
-
 			const isError = false
 			const isRejected = toolMessage.type === 'rejected'
 			const { rawParams, params } = toolMessage
 			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected, }
 
-			const relativePath = params.cwd ? getRelative(URI.file(params.cwd), accessor) : ''
-			componentParams.info = relativePath ? `Running in ${relativePath}` : undefined
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				const relativePath = params.cwd ? getRelative(URI.file(params.cwd), accessor) : ''
+				componentParams.info = relativePath ? `Running in ${relativePath}` : undefined
+				return <ToolHeaderWrapper {...componentParams} />
+			}
 
 			if (toolMessage.type === 'success') {
 				const { result } = toolMessage
@@ -1541,13 +1535,14 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const title = getTitle(toolMessage)
 			const icon = null
 
-			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
-
 			const isError = false
 			const isRejected = toolMessage.type === 'rejected'
 			const { rawParams, params } = toolMessage
 			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected, }
+
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper {...componentParams} />
+			}
 
 			if (toolMessage.type === 'success') {
 				const { persistentTerminalId } = params
@@ -1573,8 +1568,7 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const title = getTitle(toolMessage)
 			const icon = null
 
-			if (toolMessage.type === 'tool_request') return null
-			if (toolMessage.type === 'running_now') {
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
 				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
 			}
 
@@ -1619,8 +1613,7 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const title = getTitle(toolMessage)
 			const icon = null
 
-			if (toolMessage.type === 'tool_request') return null
-			if (toolMessage.type === 'running_now') {
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
 				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
 			}
 
@@ -1668,8 +1661,7 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 			const title = getTitle(toolMessage)
 			const icon = null
 
-			if (toolMessage.type === 'tool_request') return null
-			if (toolMessage.type === 'running_now') {
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
 				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
 			}
 
@@ -1696,6 +1688,37 @@ export const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapp
 					<CodeChildren>
 						{result}
 					</CodeChildren>
+				</BottomChildren>
+			}
+
+			return <ToolHeaderWrapper {...componentParams} />
+		},
+	},
+	'load_skill': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+			const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
+			const title = getTitle(toolMessage)
+			const icon = null
+
+			if (toolMessage.type === 'tool_request' || toolMessage.type === 'running_now') {
+				return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={desc1Info} icon={icon} />
+			}
+
+			const isError = toolMessage.type === 'tool_error'
+			const isRejected = toolMessage.type === 'rejected'
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected }
+
+			if (toolMessage.type === 'success') {
+				const { result } = toolMessage
+				const previewLen = 2000
+				const preview = result.content.length > previewLen
+					? result.content.substring(0, previewLen) + '...'
+					: result.content
+				componentParams.bottomChildren = <BottomChildren title='Skill content'>
+					<SmallProseWrapper>
+						<ChatMarkdownRender string={preview} chatMessageLocation={undefined} isApplyEnabled={false} />
+					</SmallProseWrapper>
 				</BottomChildren>
 			}
 
