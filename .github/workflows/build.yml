@@ -200,13 +200,15 @@ jobs:
 
   build-macos:
     name: Build on macOS
-    runs-on: macos-latest
+    # macos-14: stable Xcode 15 arm64 runner; macos-latest (Xcode 26) breaks native module builds
+    runs-on: macos-14
     timeout-minutes: 120
     env:
       NODE_OPTIONS: --max-old-space-size=8192
       GYP_DEFINES: kerberos_use_rtld=false
-      # Newer Apple Clang (Xcode 26+) breaks bundled fmt in @vscode/spdlog without this flag
+      # Apple Clang 21+ (Xcode 26 on macos-latest) breaks bundled fmt in @vscode/spdlog
       CXXFLAGS: -DFMT_CONSTEVAL=
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
 
     steps:
       - name: Checkout code
@@ -227,14 +229,15 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m pip install setuptools
-          echo "CC=$(xcrun --find clang)" >> "$GITHUB_ENV"
-          echo "CXX=$(xcrun --find clang++)" >> "$GITHUB_ENV"
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
           # gulp packages darwin policy files from this folder; OSS builds skip policy generation
           mkdir -p .build/policies/darwin
           touch .build/policies/darwin/.keep
 
       - name: Install NPM dependencies
         run: npm ci
+        env:
+          npm_config_arch: arm64
 
       - name: Build Void React bundles
         run: npm run buildreact
