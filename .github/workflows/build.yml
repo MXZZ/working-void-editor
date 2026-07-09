@@ -37,6 +37,7 @@ jobs:
         run: npm ci
         env:
           npm_config_foreground_scripts: 'true'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build Void React bundles
         run: npm run buildreact
@@ -148,6 +149,8 @@ jobs:
 
       - name: Install NPM dependencies
         run: npm ci
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build Void React bundles
         run: npm run buildreact
@@ -238,6 +241,7 @@ jobs:
         run: npm ci
         env:
           npm_config_arch: arm64
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build Void React bundles
         run: npm run buildreact
