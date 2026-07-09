@@ -205,6 +205,8 @@ jobs:
     env:
       NODE_OPTIONS: --max-old-space-size=8192
       GYP_DEFINES: kerberos_use_rtld=false
+      # Newer Apple Clang (Xcode 26+) breaks bundled fmt in @vscode/spdlog without this flag
+      CXXFLAGS: -DFMT_CONSTEVAL=
 
     steps:
       - name: Checkout code
@@ -225,6 +227,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m pip install setuptools
+          echo "CC=$(xcrun --find clang)" >> "$GITHUB_ENV"
+          echo "CXX=$(xcrun --find clang++)" >> "$GITHUB_ENV"
           # gulp packages darwin policy files from this folder; OSS builds skip policy generation
           mkdir -p .build/policies/darwin
           touch .build/policies/darwin/.keep
