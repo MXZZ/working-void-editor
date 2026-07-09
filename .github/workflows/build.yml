@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-windows:
     name: Build on Windows
     runs-on: windows-latest
     timeout-minutes: 120
@@ -111,4 +111,87 @@ jobs:
         with:
           name: void-windows
           path: artifacts/
-          retention-days: 14
+          retention-days: 90
+
+  build-linux:
+    name: Build on Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      NODE_OPTIONS: --max-old-space-size=8192
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            g++ \
+            libx11-dev \
+            libxkbfile-dev \
+            libsecret-1-dev \
+            libkrb5-dev \
+            python-is-python3 \
+            pkg-config \
+            libgtk-3-0 \
+            libgbm1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install NPM dependencies
+        run: npm ci
+
+      - name: Build Void React bundles
+        run: npm run buildreact
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Rust CLI
+        run: |
+          set -euo pipefail
+          cd cli
+          cargo build --release --bin code
+
+      - name: Package Void for Linux
+        run: |
+          set -euo pipefail
+          mkdir -p .build
+
+          # Use non-min build: mangling conflicts with Void's npm deps (e.g. google-auth-library)
+          npm run gulp vscode-linux-x64
+
+          app_dir="$(cd .. && pwd)/VSCode-linux-x64"
+          if [ ! -d "$app_dir" ]; then
+            echo "Expected packaged app at $app_dir" >&2
+            exit 1
+          fi
+
+          mkdir -p "$app_dir/bin"
+          cp cli/target/release/code "$app_dir/bin/void-tunnel"
+          chmod +x "$app_dir/bin/void-tunnel"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stage release artifacts
+        run: |
+          set -euo pipefail
+          app_dir="$(cd .. && pwd)/VSCode-linux-x64"
+
+          mkdir -p artifacts
+          tar -czf artifacts/void-linux-x64-portable.tar.gz -C .. VSCode-linux-x64
+          echo "Staged portable build: artifacts/void-linux-x64-portable.tar.gz"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: void-linux
+          path: artifacts/
+          retention-days: 90
