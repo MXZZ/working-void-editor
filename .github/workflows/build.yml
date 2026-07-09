@@ -107,6 +107,7 @@ jobs:
           }
 
       - name: Upload Artifacts
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: void-windows
@@ -190,6 +191,7 @@ jobs:
           echo "Staged portable build: artifacts/void-linux-x64-portable.tar.gz"
 
       - name: Upload Artifacts
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: void-linux
@@ -213,6 +215,11 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'npm'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       - name: Prepare macOS build environment
         run: |
@@ -270,6 +277,7 @@ jobs:
           echo "Staged portable build: artifacts/void-darwin-arm64-portable.zip"
 
       - name: Upload Artifacts
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: void-macos
