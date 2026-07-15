@@ -11,15 +11,12 @@ import { Position } from '../../../../editor/common/core/position.js';
 import { InlineCompletion, } from '../../../../editor/common/languages.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Range } from '../../../../editor/common/core/range.js';
-import { IEditorService } from '../../../services/editor/common/editorService.js';
-import { isCodeEditor } from '../../../../editor/browser/editorBrowser.js';
 import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { isWindows } from '../../../../base/common/platform.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { FeatureName } from '../common/voidSettingsTypes.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
-// import { IContextGatheringService } from './contextGatheringService.js';
 
 
 
@@ -375,6 +372,38 @@ const getPrefixAndSuffixInfo = (model: ITextModel, position: Position): PrefixAn
 }
 
 
+// Extract the import block from the top of the file. FIM models need imports
+// to know what types and functions are available, but the 50-line prefix
+// window often misses them in large files. Returns the import lines as a
+// string, or null if no imports are found or they're already in the prefix window.
+const getImportBlock = (model: ITextModel): string | null => {
+	const lineCount = model.getLineCount()
+	const importLines: string[] = []
+	let foundImport = false
+
+	for (let i = 1; i <= Math.min(lineCount, 100); i++) {
+		const line = model.getLineContent(i)
+		const trimmed = line.trim()
+
+		// Skip blank lines and comments before the first import
+		if (!foundImport && (trimmed === '' || trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*'))) continue
+
+		// Match import statements: ES6 import, require(), or TypeScript import type
+		if (/^(import|export\s+.*\s+from|const\s+\{.*\}\s*=\s*require|\/\/\/\s+<reference)/.test(trimmed)) {
+			foundImport = true
+			importLines.push(line)
+			continue
+		}
+
+		// After finding imports, stop at the first non-import line (allowing blank lines between imports)
+		if (foundImport && trimmed !== '') break
+	}
+
+	if (importLines.length === 0) return null
+	return importLines.join(_ln)
+}
+
+
 type CompletionOptions = {
 	predictionType: AutocompletionPredictionType,
 	shouldGenerate: boolean,
@@ -382,15 +411,29 @@ type CompletionOptions = {
 	llmSuffix: string,
 	stopTokens: string[],
 }
-const getCompletionOptions = (prefixAndSuffix: PrefixAndSuffixInfo, relevantContext: string, justAcceptedAutocompletion: boolean): CompletionOptions => {
+const getCompletionOptions = (prefixAndSuffix: PrefixAndSuffixInfo, importBlock: string | null, justAcceptedAutocompletion: boolean): CompletionOptions => {
 
 	let { prefix, suffix, prefixToTheLeftOfCursor, suffixToTheRightOfCursor, suffixLines, prefixLines } = prefixAndSuffix
 
 	// trim prefix and suffix to not be very large
-	suffixLines = suffix.split(_ln).slice(0, 25)
-	prefixLines = prefix.split(_ln).slice(-25)
+	suffixLines = suffix.split(_ln).slice(0, 50)
+	prefixLines = prefix.split(_ln).slice(-50)
 	prefix = prefixLines.join(_ln)
 	suffix = suffixLines.join(_ln)
+
+	// Prepend imports to the prefix so the FIM model knows what types and
+	// functions are available. Imports are real code (not a comment block),
+	// so they're in-distribution for FIM models. LSP type context was removed
+	// because comment blocks with type info are out-of-distribution and cause
+	// the model to generate conservative single-line completions.
+	let contextBlock = ''
+	if (importBlock) {
+		// Check if imports are already fully contained in the prefix window
+		const firstPrefixLine = prefixLines[0] ?? ''
+		if (!firstPrefixLine.includes('import') || !prefix.startsWith(importBlock)) {
+			contextBlock = importBlock + _ln + _ln
+		}
+	}
 
 	// Strip leading blank lines from the suffix sent to FIM. When
 	// there's a blank line between the cursor and the next code, the
@@ -419,16 +462,16 @@ const getCompletionOptions = (prefixAndSuffix: PrefixAndSuffixInfo, relevantCont
 	// All completions use stop=\n\n to let the model decide how much
 	// to produce. This gives full blocks like "condition) {\n\tbody\n}"
 	// in one tab instead of requiring separate condition + body tabs.
-	let llmPrefix = prefix
+	let llmPrefix = contextBlock + prefix
 	let llmSuffix = suffixStringIgnoringThisLine
 
 	if (suffixIsJustBracketAfterAccept) {
 		// After accepting a condition with auto-close ")", include
 		// ") {" in the prefix so the model produces body text.
-		llmPrefix = prefix + suffixToTheRightOfCursor[0] + ' {' + _ln
+		llmPrefix = contextBlock + prefix + suffixToTheRightOfCursor[0] + ' {' + _ln
 	} else if (prefixToTheLeftOfCursor.trimEnd().endsWith('{')) {
 		// Line already ends with "{", predict body on next line
-		llmPrefix = prefix + _ln
+		llmPrefix = contextBlock + prefix + _ln
 	}
 
 	let completionOptions: CompletionOptions
@@ -459,24 +502,6 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 	private _lastCompletionStart = 0
 	private _lastCompletionAccept = 0
 	private _pendingRequestId: string | null = null
-	// Trigger VS Code to re-query the inline completions provider
-	private _triggerInlineCompletions() {
-		try {
-			const activePane = this._editorService.activeEditorPane
-			if (activePane) {
-				const control = activePane.getControl()
-				if (control && isCodeEditor(control)) {
-					const controller = control.getContribution('editor.contrib.inlineCompletionsController') as any
-					const model = controller?.model?.get()
-					if (model) {
-						model.trigger()
-					}
-				}
-			}
-		} catch (e) {
-			// Ignore
-		}
-	}
 
 	// used internally by vscode
 	// fires after every keystroke and returns the completion to show
@@ -521,10 +546,12 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 			this._pendingRequestId = null
 		}
 
-		const relevantContext = ''
-		const { shouldGenerate, predictionType, llmPrefix, llmSuffix, stopTokens } = getCompletionOptions(prefixAndSuffix, relevantContext, justAcceptedAutocompletion)
+		// Gather extra context: imports and LSP type info. These run in
+		// parallel to minimize latency. Imports are synchronous (fast),
+		// LSP hover + type definitions are async with timeouts.
+		const importBlock = getImportBlock(model)
 
-
+		const { shouldGenerate, predictionType, llmPrefix, llmSuffix, stopTokens } = getCompletionOptions(prefixAndSuffix, importBlock, justAcceptedAutocompletion)
 
 		if (!shouldGenerate) return []
 
@@ -552,7 +579,7 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 				onText: () => {
 					// Non-streaming FIM delivers all text at once in onFinalMessage
 				},
-					onFinalMessage: ({ fullText }) => {
+				onFinalMessage: ({ fullText }) => {
 					this._pendingRequestId = null
 
 					let text = cleanFIMText(fullText)
@@ -562,7 +589,7 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 						text = _ln + text
 					}
 
-						resolve(text)
+					resolve(text)
 				},
 				onError: ({ message }) => {
 					this._pendingRequestId = null
@@ -578,9 +605,9 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 		})
 
 		try {
-			const insertText = await insertTextPromise
+			let insertText = await insertTextPromise
 
-				if (token?.isCancellationRequested) {
+			if (token?.isCancellationRequested) {
 				return []
 			}
 
@@ -600,9 +627,8 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 	constructor(
 		@ILanguageFeaturesService private _langFeatureService: ILanguageFeaturesService,
 		@ILLMMessageService private readonly _llmMessageService: ILLMMessageService,
-		@IEditorService private readonly _editorService: IEditorService,
 		@IVoidSettingsService private readonly _settingsService: IVoidSettingsService,
-		@IConvertToLLMMessageService private readonly _convertToLLMMessageService: IConvertToLLMMessageService
+		@IConvertToLLMMessageService private readonly _convertToLLMMessageService: IConvertToLLMMessageService,
 	) {
 		super()
 
@@ -615,9 +641,6 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 			freeInlineCompletions: (completions) => {
 				if (completions.items.length > 0) {
 					this._lastCompletionAccept = Date.now()
-					// After accepting, trigger a follow-up completion
-					// (e.g. multi-line body after if(condition))
-					this._triggerInlineCompletions()
 				}
 			},
 		}))
