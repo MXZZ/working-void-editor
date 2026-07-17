@@ -33,6 +33,8 @@ export interface ITerminalToolService {
 
 	readTerminal(terminalId: string): Promise<string>
 
+	readTerminalByName(terminalName: string, lastNCommands?: number | null): Promise<{ output: string, status: string, commands: { command: string, exitCode: number | null, duration: number }[] }>
+
 	createPersistentTerminal(opts: { cwd: string | null }): Promise<string>
 	killPersistentTerminal(terminalId: string): Promise<void>
 
@@ -114,22 +116,30 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 	private _getTerminalStatus(terminal: ITerminalInstance): string {
 		const exitCode = terminal.exitCode
-		return exitCode !== undefined
-			? `exited (code ${exitCode})`
-			: 'running'
+		if (exitCode !== undefined) return `exited (code ${exitCode})`
+		// Use CommandDetection to distinguish idle (shell at prompt) from
+		// running (command executing). Falls back to 'running' when shell
+		// integration is not available.
+		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection)
+		if (!cmdCap) return 'running'
+		if (cmdCap.executingCommand) {
+			const cmd = cmdCap.executingCommand
+			return `running: ${cmd.length > 60 ? cmd.slice(0, 57) + '...' : cmd}`
+		}
+		return 'idle'
 	}
 
 	listAllTerminals(): { name: string; status: string; lastCommand: string; isVoidTerminal: boolean }[] {
 		return [...this.terminalService.instances].map(terminal => {
-				const voidId = idOfPersistentTerminalName(terminal.title)
-				const isVoidTerminal = voidId !== null
-				return {
-					name: isVoidTerminal ? `Void Agent ${voidId === '1' ? '' : `(${voidId})`}`.trim() : terminal.title,
-					status: this._getTerminalStatus(terminal),
-					lastCommand: this._getLastCommand(terminal),
-					isVoidTerminal,
-				}
-			})
+			const voidId = idOfPersistentTerminalName(terminal.title)
+			const isVoidTerminal = voidId !== null
+			return {
+				name: isVoidTerminal ? `Void Agent ${voidId === '1' ? '' : `(${voidId})`}`.trim() : terminal.title,
+				status: this._getTerminalStatus(terminal),
+				lastCommand: this._getLastCommand(terminal),
+				isVoidTerminal,
+			}
+		})
 	}
 
 	getValidNewTerminalId(): string {
@@ -304,6 +314,71 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		return result
 	};
 
+	readTerminalByName: ITerminalToolService['readTerminalByName'] = async (terminalName, lastNCommands?) => {
+		// Find terminal by name across all instances (Void + user-created)
+		const terminal = [...this.terminalService.instances].find(t => t.title === terminalName)
+		if (!terminal) {
+			throw new Error(`Read Terminal: No terminal found with name "${terminalName}". The terminal may have been closed.`)
+		}
+		if (!terminal.xterm) {
+			throw new Error('Read Terminal: The requested terminal has not yet been rendered and therefore has no scrollback buffer available.')
+		}
+
+		// Get status and command history from CommandDetection
+		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection)
+		const status = this._getTerminalStatus(terminal)
+		const allCommands = cmdCap ? cmdCap.commands : []
+
+		// Filter to the last N commands — return their combined output via
+		// CommandDetection markers (more reliable than the raw scrollback, which
+		// may be truncated for long-running terminals).
+		if (lastNCommands !== null && lastNCommands !== undefined && lastNCommands > 0) {
+			if (allCommands.length === 0) {
+				throw new Error(`Read Terminal: last_n_commands was ${lastNCommands}, but no commands have been detected in this terminal. Shell integration may not be available.`)
+			}
+			const start = Math.max(0, allCommands.length - lastNCommands)
+			const selectedCommands = allCommands.slice(start)
+			const outputParts: string[] = []
+			for (const cmd of selectedCommands) {
+				const rawOutput = cmd.getOutput()
+				const cleanOutput = rawOutput ? removeAnsiEscapeCodes(rawOutput).replace(/\n+$/, '') : '(no output captured for this command)'
+				const exitStr = cmd.exitCode === undefined ? '(running)' : `(exit ${cmd.exitCode})`
+				outputParts.push(`$ ${cmd.command} ${exitStr}\n${cleanOutput}`)
+			}
+			let output = outputParts.join('\n\n')
+			if (output.length > MAX_TERMINAL_CHARS) {
+				const half = MAX_TERMINAL_CHARS / 2
+				output = output.slice(0, half) + '\n...\n' + output.slice(output.length - half)
+			}
+			const commands = selectedCommands.map(cmd => ({
+				command: cmd.command,
+				exitCode: cmd.exitCode ?? null,
+				duration: cmd.duration,
+			}))
+			return { output, status, commands }
+		}
+
+		// No filter — return full scrollback buffer
+		const lines: string[] = []
+		for (const line of terminal.xterm.getBufferReverseIterator()) {
+			lines.unshift(line)
+		}
+		let output = removeAnsiEscapeCodes(lines.join('\n'))
+		output = output.replace(/\n+$/, '')
+		if (output.length > MAX_TERMINAL_CHARS) {
+			const half = MAX_TERMINAL_CHARS / 2
+			output = output.slice(0, half) + '\n...\n' + output.slice(output.length - half)
+		}
+
+		const commands = allCommands.map(cmd => ({
+			command: cmd.command,
+			exitCode: cmd.exitCode ?? null,
+			duration: cmd.duration,
+		}))
+
+		return { output, status, commands }
+	}
+
 	private async _waitForCommandDetectionCapability(terminal: ITerminalInstance) {
 		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection);
 		if (cmdCap) return cmdCap
@@ -410,23 +485,23 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 						const inactivityMs = (isPersistent ? MAX_TERMINAL_BG_COMMAND_TIME : MAX_TERMINAL_INACTIVE_TIME) * 1000;
 						const backstopMs = isPersistent ? MAX_TERMINAL_BG_COMMAND_TIME * 1000 * 2 : Infinity;
 
-						const fire = () => {
+						const fire = (timeoutReason: 'inactivity' | 'backstop') => {
 							if (resolveReason) return
 							clearTimeout(inactivityTimeoutId);
 							clearTimeout(backstopTimeoutId);
-							resolveReason = { type: 'timeout' };
+							resolveReason = { type: 'timeout', reason: timeoutReason };
 							res();
 						};
 						const resetInactivity = () => {
 							clearTimeout(inactivityTimeoutId);
-							inactivityTimeoutId = setTimeout(fire, inactivityMs);
+							inactivityTimeoutId = setTimeout(() => fire('inactivity'), inactivityMs);
 						};
 
 						const dTimeout = terminal.onData(() => { resetInactivity(); });
 						disposables.push(dTimeout, toDisposable(() => { clearTimeout(inactivityTimeoutId); clearTimeout(backstopTimeoutId); }));
 						resetInactivity();
 						if (isPersistent) {
-							backstopTimeoutId = setTimeout(fire, backstopMs);
+							backstopTimeoutId = setTimeout(() => fire('backstop'), backstopMs);
 						}
 					})
 
@@ -436,7 +511,7 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 
 				// read result if timed out, since we didn't get it (could clean this code up but it's ok)
-					if (resolveReason?.type === 'timeout') {
+				if (resolveReason?.type === 'timeout') {
 					// Grace period — onCommandFinished may fire just after the inactivity
 					// timeout. Listener is still alive (disposed after this block).
 					if (cmdCap) {
