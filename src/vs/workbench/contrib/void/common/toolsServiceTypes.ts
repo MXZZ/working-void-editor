@@ -6,7 +6,9 @@ import { RawToolParamsObj } from './sendLLMMessageTypes.js';
 
 
 
-export type TerminalResolveReason = { type: 'timeout' } | { type: 'done', exitCode: number }
+export type TerminalResolveReason =
+	| { type: 'timeout', reason: 'inactivity' | 'backstop' }
+	| { type: 'done', exitCode: number }
 
 export type LintErrorItem = { code: string, message: string, startLineNumber: number, endLineNumber: number }
 
@@ -100,6 +102,8 @@ export type BuiltinToolCallParams = {
 	'open_persistent_terminal': { cwd: string | null },
 	'run_persistent_command': { command: string; persistentTerminalId: string },
 	'kill_persistent_terminal': { persistentTerminalId: string },
+	// --- terminal read ---
+	'read_terminal': { terminalName: string, lastNCommands: number | null },
 	// --- web ---
 	'fetch_url': { url: string },
 	// --- semantic search ---
@@ -133,6 +137,8 @@ export type BuiltinToolResultType = {
 	'run_persistent_command': { result: string; resolveReason: TerminalResolveReason; },
 	'open_persistent_terminal': { persistentTerminalId: string },
 	'kill_persistent_terminal': {},
+	// --- terminal read ---
+	'read_terminal': { output: string, status: string, commands: { command: string, exitCode: number | null, duration: number }[] },
 	// --- semantic search ---
 	'semantic_search': { results: { uri: URI, startLine: number, endLine: number, snippet: string, score: number, indexStatus: string, indexProgress: { indexed: number, total: number } }[], noResultReason?: string },
 	// --- web ---
