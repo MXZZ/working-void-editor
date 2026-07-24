@@ -19,6 +19,7 @@ import { builtinToolNames, isABuiltinToolName, MAX_FILE_CHARS_PAGE } from '../..
 import { CopyButton, EditToolAcceptRejectButtonsHTML, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { ToolApprovalTypeSwitch } from '../void-settings-tsx/Settings.js';
 import { persistentTerminalNameOfId } from '../../../terminalToolService.js';
+import { splitCommandsWithApproval } from '../../../../common/terminalAutoApprove.js';
 import { removeMCPToolNamePrefix } from '../../../../common/mcpServiceTypes.js';
 import { toolDefinitionOfToolName } from '../../../tools/toolRegistry.js';
 
@@ -387,11 +388,11 @@ export const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name
 	else {
 		const toolName = t.name as BuiltinToolName
 		const title = toolDefinitionOfToolName[toolName]!.title
-		// loadingTitleWrapper returns a React element; if we also have a batch
-		// prefix, wrap both in a fragment instead of `${prefix}${base}` (which
-		// would stringify the element to '[object Object]').
+		// Put the prefix INSIDE loadingTitleWrapper so the prefix text and the
+		// (block-level) flex span stay on one line. Putting prefix outside the
+		// flex span made the inline prefix wrap onto its own line while running.
 		if (t.type === 'running_now')
-			return prefix ? <>{prefix}{loadingTitleWrapper(title.running)}</> : loadingTitleWrapper(title.running)
+			return loadingTitleWrapper(prefix ? <>{prefix}{title.running}</> : title.running)
 		const base = t.type === 'success' ? title.done : title.proposed
 		return prefix ? `${prefix}${base}` : base
 	}
@@ -576,6 +577,8 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 	const voidSettingsService = accessor.get('IVoidSettingsService')
 	const voidSettingsState = useSettingsState()
 	const workspaceContextService = accessor.get('IWorkspaceContextService')
+	const terminalToolService = accessor.get('ITerminalToolService')
+	const quickInputService = accessor.get('IQuickInputService')
 
 	// Terminal tools use per-tool approve/reject (concurrent execution).
 	// Non-terminal tools use the serial approve-latest/reject-latest path.
@@ -621,6 +624,58 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 		metricsService.capture('Tool Request Rejected', {})
 	}, [chatThreadsService, isTerminal, toolId])
 
+	// "Allow" — adds the command prefix to the per-workspace allowlist,
+	// then approves the current request. Only shown for terminal tools with a
+	// command string, and only if at least one chain unit can be auto-approved
+	// (no dangerous patterns like while/for/eval) AND isn't already approved.
+	const terminalParams = isTerminal ? params as BuiltinToolCallParams['run_command'] | BuiltinToolCallParams['run_persistent_command'] | undefined : undefined
+	const commandStatuses = useMemo(() => {
+		if (!terminalParams || !('command' in terminalParams) || !terminalParams.command) return []
+		const allowlist = terminalToolService.getAutoApproveAllowlist()
+		return splitCommandsWithApproval(terminalParams.command, allowlist)
+	}, [terminalParams, terminalToolService])
+	// Show the button if there's at least one NEW safe command. Dangerous
+	// units (while/for/eval) are excluded from the allowlist — they'll always
+	// require manual approval. But safe units in the same chain CAN be
+	// approved, and shouldAutoApprove will still block the full chain if any
+	// unit is dangerous.
+	const hasNewCommands = commandStatuses.length > 0 && commandStatuses.some(s => s.canApprove && !s.isApproved)
+	const hasApprovedCommands = commandStatuses.some(s => s.isApproved) || terminalToolService.getAutoApproveAllowlist().length > 0
+	const onManageAllowlist = useCallback(() => {
+		const allowlist = terminalToolService.getAutoApproveAllowlist()
+		if (allowlist.length === 0) return
+		const pick = quickInputService.createQuickPick<{ label: string, command: string }>()
+		pick.items = allowlist.map(cmd => ({ label: cmd, command: cmd }))
+		pick.canSelectMany = true
+		pick.title = 'Terminal Allowlist'
+		pick.placeholder = 'Select commands to remove, then confirm'
+		pick.buttons = [{ iconClass: 'codicon-check', tooltip: 'Remove selected' }]
+		pick.onDidAccept(() => {
+			for (const item of pick.selectedItems) {
+				terminalToolService.removeFromAutoApproveAllowlist(item.command)
+			}
+			pick.hide()
+		})
+		pick.show()
+	}, [quickInputService, terminalToolService])
+	const tooltipContent = commandStatuses.length > 0
+		? 'Auto-approve next time:\n' + commandStatuses.filter(s => s.canApprove).map(s =>
+			(s.isApproved ? '✓ ' : '+ ') + s.text
+		).join('\n')
+		: ''
+	const onAllow = useCallback(() => {
+		for (const s of commandStatuses) {
+			if (s.canApprove && !s.isApproved) {
+				terminalToolService.addToAutoApproveAllowlist(s.text)
+			}
+		}
+		try {
+			const tid = chatThreadsService.state.currentThreadId
+			chatThreadsService.approveToolRequest(tid, toolId)
+			metricsService.capture('Tool Request Added To Allowlist', {})
+		} catch (e) { console.error('Error while allowing message in chat:', e) }
+	}, [commandStatuses, terminalToolService, chatThreadsService, metricsService, toolId])
+
 	const approveButton = (
 		<button
 			onClick={onAccept}
@@ -636,6 +691,27 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 			Approve
 		</button>
 	)
+
+	const allowButton = hasNewCommands ? (
+		<button
+			onClick={onAllow}
+			data-tooltip-id='void-tooltip'
+			data-tooltip-content={tooltipContent}
+			data-tooltip-place='top'
+			data-tooltip-delay-show={300}
+			className={`
+                px-2 py-1
+                bg-[var(--vscode-button-background)]
+                text-[var(--vscode-button-foreground)]
+                hover:bg-[var(--vscode-button-hoverBackground)]
+                rounded
+                text-sm font-medium
+                opacity-80
+            `}
+		>
+			Allow
+		</button>
+	) : null
 
 	const cancelButton = (
 		<button
@@ -664,6 +740,22 @@ export const ToolRequestAcceptRejectButtons = ({ toolName, threadId, toolId, par
 	// This avoids the button disappearing for 2s during lint checks after edits.
 	return <div className="flex gap-2 mx-0.5 items-center">
 		{approveButton}
+		{allowButton}
+		{hasApprovedCommands ? (
+			<button
+				onClick={onManageAllowlist}
+				className={`
+                    px-2 py-1
+                    text-[var(--vscode-button-secondaryForeground)]
+                    hover:bg-[var(--vscode-button-secondaryHoverBackground)]
+                    rounded
+                    text-sm font-medium
+                    opacity-80
+                `}
+			>
+				Manage
+			</button>
+		) : null}
 		{cancelButton}
 		{approvalToggle}
 	</div>

@@ -29,6 +29,7 @@ import { IMetricsService } from '../common/metricsService.js';
 import { IVoidModelService } from '../common/voidModelService.js';
 import { findLast } from '../../../../base/common/arraysFind.js';
 import { IEditCodeService } from './editCodeServiceInterface.js';
+import { ITerminalToolService } from './terminalToolService.js';
 // import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js'; // checkpoint disabled — see checkpoint-storage-refactor.md
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
@@ -46,6 +47,7 @@ import { buildTestMessages, runSimulatedStream } from './chatThreadDevTools.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IMCPService } from '../common/mcpService.js';
 import { RawMCPToolCall } from '../common/mcpServiceTypes.js';
+import { shouldAutoApprove } from '../common/terminalAutoApprove.js';
 
 
 // related to retrying when LLM message has error
@@ -658,6 +660,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@IRequestTelemetryService private readonly _requestTelemetryService: IRequestTelemetryService,
 		@IEnvironmentService private readonly _environmentService: IEnvironmentService,
 		@ILifecycleService private readonly _lifecycleService: ILifecycleService,
+		@ITerminalToolService private readonly _terminalToolService: ITerminalToolService,
 	) {
 		super()
 		void this._editCodeService // checkpoint disabled — kept for DI, see checkpoint-storage-refactor.md
@@ -1999,7 +2002,16 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				if (nextApprovalType === 'terminal') {
 					const mode = normalizeAutoApproveMode(this._settingsService.state.globalSettings.autoApprove.terminal)
 					// Terminal tools are NOT workspace-scoped, so 'workspace' === 'all'
-					if (mode === 'all' || mode === 'workspace') {
+					// Also check the per-workspace command allowlist
+					let isAutoApproved = mode === 'all' || mode === 'workspace'
+					if (!isAutoApproved) {
+						const terminalParams = next.params as BuiltinToolCallParams['run_command'] | BuiltinToolCallParams['run_persistent_command'] | undefined
+						if (terminalParams && 'command' in terminalParams) {
+							const allowlist = this._terminalToolService.getAutoApproveAllowlist()
+							isAutoApproved = shouldAutoApprove(terminalParams.command, allowlist)
+						}
+					}
+					if (isAutoApproved) {
 						try {
 							const validated = this._toolsService.validateParams[next.name](next.rawParams)
 							this._fireConcurrentTerminal(threadId, { ...next, params: validated })
@@ -2553,6 +2565,18 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						autoApprove = urisToCheck.length > 0 && urisToCheck.every(u => this._workspaceContextService.isInsideWorkspace(u))
 					} else {
 						autoApprove = true
+					}
+				}
+
+				// Terminal command allowlist — check if the command matches a prefix
+				// in the per-workspace allowlist (added via "Always approve" button).
+				if (!autoApprove && approvalType === 'terminal' && isBuiltInTool) {
+					const terminalParams = toolParams as BuiltinToolCallParams['run_command'] | BuiltinToolCallParams['run_persistent_command']
+					if (terminalParams && 'command' in terminalParams) {
+						const allowlist = this._terminalToolService.getAutoApproveAllowlist()
+						if (shouldAutoApprove(terminalParams.command, allowlist)) {
+							autoApprove = true
+						}
 					}
 				}
 
@@ -3666,9 +3690,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const fsPathsSet = new Set<string>()
 		const uris: URI[] = []
 		const addURI = (uri: URI) => {
-			if (!fsPathsSet.has(uri.fsPath)) uris.push(uri)
-			fsPathsSet.add(uri.fsPath)
-			uris.push(uri)
+			if (!fsPathsSet.has(uri.fsPath)) {
+				fsPathsSet.add(uri.fsPath)
+				uris.push(uri)
+			}
 		}
 
 		for (const m of thread.messages) {
@@ -3775,88 +3800,90 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 			// check all prevUris for the target
 			for (const uri of prevUris) {
+				const { model } = await this._voidModelService.getModelSafe(uri)
+				try {
+					if (!model) continue
 
-				const modelRef = await this._voidModelService.getModelSafe(uri)
-				const { model } = modelRef
-				if (!model) continue
+					const matches = model.findMatches(
+						target,
+						false, // searchOnlyEditableRange
+						false, // isRegex
+						true,  // matchCase
+						null, //' ',   // wordSeparators
+						true   // captureMatches
+					);
 
-				const matches = model.findMatches(
-					target,
-					false, // searchOnlyEditableRange
-					false, // isRegex
-					true,  // matchCase
-					null, //' ',   // wordSeparators
-					true   // captureMatches
-				);
+					const firstThree = matches.slice(0, 3);
 
-				const firstThree = matches.slice(0, 3);
+					// take first 3 occurences, attempt to goto definition on them
+					for (const match of firstThree) {
+						const position = new Position(match.range.startLineNumber, match.range.startColumn);
+						const definitionProviders = this._languageFeaturesService.definitionProvider.ordered(model);
 
-				// take first 3 occurences, attempt to goto definition on them
-				for (const match of firstThree) {
-					const position = new Position(match.range.startLineNumber, match.range.startColumn);
-					const definitionProviders = this._languageFeaturesService.definitionProvider.ordered(model);
+						for (const provider of definitionProviders) {
 
-					for (const provider of definitionProviders) {
+							const _definitions = await provider.provideDefinition(model, position, CancellationToken.None);
 
-						const _definitions = await provider.provideDefinition(model, position, CancellationToken.None);
+							if (!_definitions) continue;
 
-						if (!_definitions) continue;
+							const definitions = Array.isArray(_definitions) ? _definitions : [_definitions];
 
-						const definitions = Array.isArray(_definitions) ? _definitions : [_definitions];
+							for (const definition of definitions) {
 
-						for (const definition of definitions) {
+								return {
+									uri: definition.uri,
+									selection: {
+										startLineNumber: definition.range.startLineNumber,
+										startColumn: definition.range.startColumn,
+										endLineNumber: definition.range.endLineNumber,
+										endColumn: definition.range.endColumn,
+									},
+									displayText: _codespanStr,
+								};
 
-							return {
-								uri: definition.uri,
-								selection: {
-									startLineNumber: definition.range.startLineNumber,
-									startColumn: definition.range.startColumn,
-									endLineNumber: definition.range.endLineNumber,
-									endColumn: definition.range.endColumn,
-								},
-								displayText: _codespanStr,
-							};
+								// const defModelRef = await this._textModelService.createModelReference(definition.uri);
+								// const defModel = defModelRef.object.textEditorModel;
 
-							// const defModelRef = await this._textModelService.createModelReference(definition.uri);
-							// const defModel = defModelRef.object.textEditorModel;
+								// try {
+								// 	const symbolProviders = this._languageFeaturesService.documentSymbolProvider.ordered(defModel);
 
-							// try {
-							// 	const symbolProviders = this._languageFeaturesService.documentSymbolProvider.ordered(defModel);
+								// 	for (const symbolProvider of symbolProviders) {
+								// 		const symbols = await symbolProvider.provideDocumentSymbols(
+								// 			defModel,
+								// 			CancellationToken.None
+								// 		);
 
-							// 	for (const symbolProvider of symbolProviders) {
-							// 		const symbols = await symbolProvider.provideDocumentSymbols(
-							// 			defModel,
-							// 			CancellationToken.None
-							// 		);
+								// 		if (symbols) {
+								// 			const symbol = symbols.find(s => {
+								// 				const symbolRange = s.range;
+								// 				return symbolRange.startLineNumber <= definition.range.startLineNumber &&
+								// 					symbolRange.endLineNumber >= definition.range.endLineNumber &&
+								// 					(symbolRange.startLineNumber !== definition.range.startLineNumber || symbolRange.startColumn <= definition.range.startColumn) &&
+								// 					(symbolRange.endLineNumber !== definition.range.endLineNumber || symbolRange.endColumn >= definition.range.endColumn);
+								// 			});
 
-							// 		if (symbols) {
-							// 			const symbol = symbols.find(s => {
-							// 				const symbolRange = s.range;
-							// 				return symbolRange.startLineNumber <= definition.range.startLineNumber &&
-							// 					symbolRange.endLineNumber >= definition.range.endLineNumber &&
-							// 					(symbolRange.startLineNumber !== definition.range.startLineNumber || symbolRange.startColumn <= definition.range.startColumn) &&
-							// 					(symbolRange.endLineNumber !== definition.range.endLineNumber || symbolRange.endColumn >= definition.range.endColumn);
-							// 			});
-
-							// 			// if we got to a class/function get the full range and return
-							// 			if (symbol?.kind === SymbolKind.Function || symbol?.kind === SymbolKind.Method || symbol?.kind === SymbolKind.Class) {
-							// 				return {
-							// 					uri: definition.uri,
-							// 					selection: {
-							// 						startLineNumber: definition.range.startLineNumber,
-							// 						startColumn: definition.range.startColumn,
-							// 						endLineNumber: definition.range.endLineNumber,
-							// 						endColumn: definition.range.endColumn,
-							// 					}
-							// 				};
-							// 			}
-							// 		}
-							// 	}
-							// } finally {
-							// 	defModelRef.dispose();
-							// }
+								// 			// if we got to a class/function get the full range and return
+								// 			if (symbol?.kind === SymbolKind.Function || symbol?.kind === SymbolKind.Method || symbol?.kind === SymbolKind.Class) {
+								// 				return {
+								// 					uri: definition.uri,
+								// 					selection: {
+								// 						startLineNumber: definition.range.startLineNumber,
+								// 						startColumn: definition.range.startColumn,
+								// 						endLineNumber: definition.range.endLineNumber,
+								// 						endColumn: definition.range.endColumn,
+								// 					}
+								// 				};
+								// 			}
+								// 		}
+								// 	}
+								// } finally {
+								// 	defModelRef.dispose();
+								// }
+							}
 						}
 					}
+				} finally {
+					this._voidModelService.releaseModel(uri)
 				}
 			}
 
@@ -4233,6 +4260,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._pendingImageBytesByThread.delete(threadId)
 		this._requestTelemetryService.forgetThread(threadId)
 		this._loadedMessageThreadIds.delete(threadId)
+
+		// Clean up stream state and throttle scheduler to prevent memory leaks
+		delete this.streamState[threadId]
+		const throttleEntry = this._streamTextThrottle.get(threadId)
+		if (throttleEntry) {
+			throttleEntry.scheduler.dispose()
+			this._streamTextThrottle.delete(threadId)
+		}
 
 		// Phase E — also clear any per-workspace last-active pointers to this
 		// thread so it doesn't get auto-pinned back via restore on next reload.
